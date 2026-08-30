@@ -1,24 +1,26 @@
 //+------------------------------------------------------------------+
 //|                                        GoldTradesBreakoutEA.mq5  |
 //|                                                                  |
-//|  Long-only resistance-breakout EA.                               |
+//|  Long-only range-breakout EA.                                    |
 //|                                                                  |
-//|  Rules implemented (from the "Gold Trades" Pine indicator):       |
-//|    ENTRY  : price breaks the last confirmed pivot high            |
-//|             (resistance), AND fast MA (9) > slow MA (20).         |
-//|    EXIT   : the bar CLOSES under the fast MA (9).                 |
-//|    WINDOW : entries only in the first N minutes (default 120)     |
-//|             of the New York session (09:30 ET).                   |
+//|    ENTRY  : close breaks the ceiling of a VALIDATED consolidation |
+//|             range, while fast MA (9) > slow MA (20).              |
+//|    SIZING : risk % of equity against the stop, then scaled by two |
+//|             extension gates (150 MA stretch, day-open 9 MA        |
+//|             stretch) - full size, half size, or no trade.         |
+//|    FILL   : 50% on the breakout, the other 50% if the first bar   |
+//|             in the trade closes green.                            |
+//|    ADDS   : a further slice at each +1R, capped.                  |
+//|    EXIT   : the bar closes under the fast MA (9).                 |
+//|    WINDOW : entries only in the first N minutes of the NY session. |
 //|                                                                  |
-//|  Additions beyond the stated rules, all optional and visible in   |
-//|  the inputs: protective stop (default = swing low), optional take |
-//|  profit, risk-based lot sizing, spread filter, trade cap per day. |
-//|  Set StopMode = SL_NONE for behaviour identical to the raw rules. |
+//|  Run this on M5 to match the indicator: the 150 MA and the        |
+//|  "once 5min closes" open check both use the CHART timeframe.      |
 //+------------------------------------------------------------------+
 #property copyright "Gold Trades"
 #property link      ""
-#property version   "1.10"
-#property description "Long-only breakout of a validated consolidation range, filtered by 9>20 MA, exit on close under the 9 MA, first two hours of the NY session."
+#property version   "1.20"
+#property description "Range breakout, 9>20 filter, percentile extension gates, split entry with pyramiding, exit on close under the 9 MA."
 
 #include <Trade\Trade.mqh>
 
@@ -33,11 +35,10 @@ enum ENUM_BREAK_MODE
 
 enum ENUM_SL_MODE
   {
-   SL_NONE       = 0,    // No stop (pure "exit on close under 9 MA")
+   SL_RANGE_LOW  = 0,    // Below the floor of the broken range
    SL_SWING_LOW  = 1,    // Below the lowest low of the last N bars
    SL_ATR        = 2,    // ATR multiple below entry
-   SL_POINTS     = 3,    // Fixed distance in points
-   SL_RANGE_LOW  = 4     // Below the floor of the broken range
+   SL_POINTS     = 3     // Fixed distance in points
   };
 
 enum ENUM_LEVEL_SOURCE
@@ -48,8 +49,8 @@ enum ENUM_LEVEL_SOURCE
 
 enum ENUM_LOT_MODE
   {
-   LOT_FIXED     = 0,    // Fixed lot size
-   LOT_RISK_PCT  = 1     // % of balance risked to the stop (needs a stop)
+   LOT_RISK_PCT  = 0,    // % of equity risked to the stop (dynamic)
+   LOT_FIXED     = 1     // Fixed lot size
   };
 
 //====================================================================
@@ -71,12 +72,31 @@ input int    InpMinTouches   = 2;     // Times the ceiling must have been tested
 input double InpTouchTolATR  = 0.15;  // How close to the ceiling counts as a touch (ATR)
 
 input group "=== Pivot high (LEVEL_PIVOT_HIGH) ==="
-input int             InpPivotLeft      = 5;      // Pivot high - left bars
-input int             InpPivotRight     = 5;      // Pivot high - right bars (confirmation delay)
-input int             InpPivotScanBars  = 300;    // How far back to look for the last pivot
+input int    InpPivotLeft     = 5;    // Pivot high - left bars
+input int    InpPivotRight    = 5;    // Pivot high - right bars (confirmation delay)
+input int    InpPivotScanBars = 300;  // How far back to look for the last pivot
+
+input group "=== Breakout ==="
 input ENUM_BREAK_MODE InpBreakMode      = BREAK_ON_CLOSE; // Breakout trigger
-input double          InpBreakBufferPts = 0;      // Extra buffer above the level (points)
+input double          InpBreakBufferPts = 0;    // Extra buffer above the level (points)
 input bool            InpOneEntryPerLevel = true; // Only one trade per resistance level
+input bool            InpRequireGreenBreak = true; // Breakout bar must close green
+
+input group "=== Extension gate: 150 MA (percentile) ==="
+input bool   InpUseExtFilter   = true;   // Scale size by how stretched price is from the 150 MA
+input int    InpExtMaPeriod    = 150;    // Long MA period
+input ENUM_MA_METHOD InpExtMaMethod = MODE_SMA; // Long MA method
+input int    InpExtLookback    = 500;    // Bars of history the percentile ranks against
+input double InpExtWarnRank    = 70;     // >= this percentile -> reduced size
+input double InpExtExtremeRank = 90;     // >= this percentile -> no trade
+input double InpExtWarnMult    = 0.5;    // Size multiplier inside the warn band
+input double InpExtFloorPct    = 0.0;    // Below this raw |%| always count as normal (0 = off)
+
+input group "=== Extension gate: day open vs the 9 MA ==="
+input bool   InpUseOpenCheck    = true;  // Check the stretch at the first window bar's close
+input double InpOpenWarnRank    = 70;    // >= this percentile -> reduced size for the day
+input double InpOpenExtremeRank = 90;    // >= this percentile -> no trades that day
+input double InpOpenWarnMult    = 0.5;   // Size multiplier inside the warn band
 
 input group "=== Trading window (New York open) ==="
 input bool   InpUseManualWindow    = false;  // Use a manual server-time window instead
@@ -88,22 +108,28 @@ input int    InpWindowMinutes      = 120;    // Window length in minutes (2 hour
 input bool   InpCloseAtWindowEnd   = false;  // Force-close any open trade when window ends
 
 input group "=== Exit ==="
-input double InpExitBufferPts      = 0;      // Close only if bar closes this far under the 9 MA (points)
+input double InpExitBufferPts      = 0;      // Close only if the bar closes this far under the 9 MA
 
-input group "=== Risk / stops ==="
+input group "=== Stop / target ==="
 input ENUM_SL_MODE InpStopMode     = SL_RANGE_LOW; // Protective stop mode
 input int          InpSwingLookback= 10;     // SL_SWING_LOW: bars used for the swing low
-input double       InpSwingPadPts  = 20;     // SL_SWING_LOW: pad below the swing low (points)
+input double       InpStopPadPts   = 20;     // Pad below the range/swing low (points)
 input int          InpAtrPeriod    = 14;     // ATR period (range test, SL_ATR)
 input double       InpAtrMult      = 1.5;    // SL_ATR: ATR multiple
-input double       InpRangePadPts  = 20;     // SL_RANGE_LOW: pad below the range floor (points)
 input double       InpStopPoints   = 500;    // SL_POINTS: stop distance in points
-input double       InpTakeProfitR  = 0;      // Take profit as R multiple (0 = none, exit on MA only)
 
 input group "=== Position sizing ==="
-input ENUM_LOT_MODE InpLotMode     = LOT_FIXED; // Lot sizing mode
-input double        InpFixedLots   = 0.01;   // Fixed lot size
-input double        InpRiskPercent = 1.0;    // Risk % of balance (LOT_RISK_PCT)
+input ENUM_LOT_MODE InpLotMode     = LOT_RISK_PCT; // Sizing mode
+input double        InpRiskPercent = 1.0;    // Risk % of equity for the FULL planned position
+input double        InpFixedLots   = 0.10;   // LOT_FIXED: full planned position
+
+input group "=== Scale-in / pyramiding ==="
+input double InpInitialPct     = 50;    // % of the planned size taken on the breakout
+input bool   InpAddOnGreen     = true;  // Add the rest if the first bar in the trade closes green
+input bool   InpPyramid        = true;  // Keep adding while the trade works
+input double InpPyramidPct     = 50;    // % of the planned size per +1R add
+input int    InpMaxAdds        = 3;     // Max +1R adds
+input bool   InpBreakEvenOnAdd = true;  // Move the stop to breakeven on the first +1R add
 
 input group "=== Execution / housekeeping ==="
 input ulong  InpMagic          = 20260830;   // Magic number
@@ -119,13 +145,34 @@ CTrade   g_trade;
 
 int      g_hFast = INVALID_HANDLE;
 int      g_hSlow = INVALID_HANDLE;
+int      g_hExt  = INVALID_HANDLE;
 int      g_hAtr  = INVALID_HANDLE;
 
 datetime g_lastBarTime   = 0;
 int      g_tradesToday   = 0;
 int      g_tradeDay      = -1;
-double   g_lastUsedLevel = 0.0;   // resistance level of the most recent entry
-int      g_windowStartMin= -1;    // resolved window start, minutes from server midnight
+double   g_lastUsedLevel = 0.0;
+int      g_windowStartMin= -1;
+
+// Per-trade state
+double   g_plannedLots   = 0.0;   // full intended size for the live trade
+double   g_entryPrice    = 0.0;
+double   g_riskDist      = 0.0;   // entry -> initial stop, one R
+double   g_initialStop   = 0.0;
+int      g_addsDone      = 0;     // +1R adds already taken
+bool     g_secondHalfOn  = false; // the green-candle half is placed (or waived)
+datetime g_entryBarTime  = 0;     // open time of the first bar we were in the trade
+
+// Per-day state
+bool     g_openChecked   = false;
+double   g_dayOpenMult   = 1.0;
+
+// Cached diagnostics for the panel
+bool     g_extReady      = false;
+double   g_extRank       = 0.0;
+double   g_extPct        = 0.0;
+double   g_extMult       = 1.0;
+double   g_openRank      = 0.0;
 
 //+------------------------------------------------------------------+
 //| Helpers - time                                                    |
@@ -135,16 +182,13 @@ datetime MidnightOf(const int year,const int mon,const int day)
    return (datetime)StringToTime(StringFormat("%04d.%02d.%02d 00:00:00",year,mon,day));
   }
 
-// Day-of-month of the nth given weekday (0=Sunday) in a month.
 int NthWeekdayDay(const int year,const int mon,const int weekday,const int nth)
   {
    MqlDateTime d;
    TimeToStruct(MidnightOf(year,mon,1),d);
-   int firstDow = d.day_of_week;
-   return 1 + ((weekday - firstDow) + 7) % 7 + (nth-1)*7;
+   return 1 + ((weekday - d.day_of_week) + 7) % 7 + (nth-1)*7;
   }
 
-// US daylight saving: 2nd Sunday of March 07:00 UTC -> 1st Sunday of November 06:00 UTC.
 bool IsUsDst(const datetime utc)
   {
    MqlDateTime d;
@@ -155,19 +199,15 @@ bool IsUsDst(const datetime utc)
    return (utc >= dstOn && utc < dstOff);
   }
 
-// Resolve the window start (minutes after server midnight) for the given server time.
 int ResolveWindowStartMinutes(const datetime serverNow)
   {
    if(InpUseManualWindow)
       return InpManualStartHour*60 + InpManualStartMinute;
 
-// Approximate UTC using the winter offset - only ambiguous within an hour of a
-// DST switch, which is outside the NY window anyway.
    long     offsetSec = (long)MathRound(InpBrokerGmtOffsetWin*3600.0);
    datetime approxUtc = (datetime)((long)serverNow - offsetSec);
    bool     dst       = IsUsDst(approxUtc);
 
-// NY 09:30 ET expressed in UTC: 13:30 during EDT, 14:30 during EST.
    double nyOpenUtcMin = dst ? (13*60+30) : (14*60+30);
    double brokerOffMin = InpBrokerGmtOffsetWin*60.0 + ((InpBrokerFollowsUsDst && dst) ? 60.0 : 0.0);
 
@@ -178,17 +218,17 @@ int ResolveWindowStartMinutes(const datetime serverNow)
    return startMin;
   }
 
-bool InTradingWindow(const datetime serverNow)
+bool InTradingWindow(const datetime t)
   {
    MqlDateTime d;
-   TimeToStruct(serverNow,d);
+   TimeToStruct(t,d);
    int nowMin = d.hour*60 + d.min;
    int start  = g_windowStartMin;
    int end    = start + InpWindowMinutes;
 
    if(end <= 1440)
       return (nowMin >= start && nowMin < end);
-   return (nowMin >= start || nowMin < (end - 1440));   // window wraps past midnight
+   return (nowMin >= start || nowMin < (end - 1440));
   }
 
 //+------------------------------------------------------------------+
@@ -210,7 +250,6 @@ bool IsPivotHighAt(const MqlRates &r[],const int shift,const int left,const int 
    return true;
   }
 
-// Most recent confirmed pivot high at or older than startShift. 0.0 = none found.
 double FindLastPivotHigh(const MqlRates &r[],const int startShift,const int left,const int right,const int maxScan)
   {
    int total = ArraySize(r);
@@ -233,10 +272,6 @@ struct RangeInfo
    int               touches;
   };
 
-// Look at InpRangeBars bars starting at startShift and decide whether they form a
-// tradeable consolidation: a box that is TIGHT relative to ATR and whose ceiling
-// has been TESTED more than once. A clean trend leg fails the tightness test, which
-// is the whole point - it is what separates a range breakout from a new swing high.
 void DetectRange(const MqlRates &r[],const int startShift,const double atr,RangeInfo &out)
   {
    out.valid     = false;
@@ -275,11 +310,81 @@ void DetectRange(const MqlRates &r[],const int startShift,const double atr,Range
   }
 
 //+------------------------------------------------------------------+
-//| Helpers - position / orders                                       |
+//| Helpers - extension percentile                                    |
+//|                                                                   |
+//| A fixed % threshold cannot work on two timeframes at once: price   |
+//| sits far closer to a 150 MA on M5 than on D1. Ranking the current  |
+//| stretch against its own recent history is self-calibrating, so the |
+//| same settings mean the same thing on any chart or symbol.          |
 //+------------------------------------------------------------------+
-bool GetOpenPosition(ulong &ticket)
+bool ExtensionRank(const int maHandle,const int lookback,double &rankOut,double &extPctOut)
   {
-   ticket = 0;
+   rankOut   = 0.0;
+   extPctOut = 0.0;
+   if(maHandle == INVALID_HANDLE || lookback < 10)
+      return false;
+
+   int need = lookback + 2;
+
+   double ma[];
+   ArraySetAsSeries(ma,true);
+   if(CopyBuffer(maHandle,0,0,need,ma) < need)
+      return false;
+
+   MqlRates r[];
+   ArraySetAsSeries(r,true);
+   if(CopyRates(_Symbol,_Period,0,need,r) < need)
+      return false;
+
+   // Signed extension on the last closed bar; the rank uses the absolute value.
+   if(ma[1] == 0.0)
+      return false;
+   extPctOut = 100.0 * (r[1].close - ma[1]) / ma[1];
+
+   double cur   = MathAbs(extPctOut);
+   int    below = 0;
+   int    count = 0;
+   for(int i=2; i<=lookback+1; i++)
+     {
+      if(ma[i] == 0.0)
+         continue;
+      double e = MathAbs(100.0 * (r[i].close - ma[i]) / ma[i]);
+      if(e <= cur)
+         below++;
+      count++;
+     }
+   if(count <= 0)
+      return false;
+
+   rankOut = 100.0 * below / count;
+   return true;
+  }
+
+// Percentile -> size multiplier. The raw-% floor stops a dead-flat market from
+// reading "extreme" merely because it is the calmest stretch in the lookback.
+double RankToMultiplier(const double rank,const double extPct,const double warnRank,
+                        const double extremeRank,const double warnMult,const double floorPct)
+  {
+   if(floorPct > 0.0 && MathAbs(extPct) < floorPct)
+      return 1.0;
+   if(rank >= extremeRank)
+      return 0.0;
+   if(rank >= warnRank)
+      return warnMult;
+   return 1.0;
+  }
+
+//+------------------------------------------------------------------+
+//| Helpers - positions (aggregate, so scaling in works on both        |
+//| netting and hedging accounts)                                      |
+//+------------------------------------------------------------------+
+bool GetPositionAggregate(double &volume,double &avgPrice,int &count)
+  {
+   volume   = 0.0;
+   avgPrice = 0.0;
+   count    = 0;
+   double weighted = 0.0;
+
    for(int i=PositionsTotal()-1; i>=0; i--)
      {
       ulong t = PositionGetTicket(i);
@@ -289,12 +394,53 @@ bool GetOpenPosition(ulong &ticket)
          continue;
       if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
          continue;
-      ticket = t;
-      return true;
+
+      double v = PositionGetDouble(POSITION_VOLUME);
+      volume  += v;
+      weighted += v * PositionGetDouble(POSITION_PRICE_OPEN);
+      count++;
      }
-   return false;
+
+   if(volume > 0.0)
+      avgPrice = weighted / volume;
+   return (count > 0);
   }
 
+void CloseAllPositions()
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      g_trade.PositionClose(t);
+     }
+  }
+
+void SetStopOnAll(const double sl)
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic)
+         continue;
+      double tp = PositionGetDouble(POSITION_TP);
+      if(MathAbs(PositionGetDouble(POSITION_SL) - sl) > _Point/2.0)
+         g_trade.PositionModify(t,sl,tp);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Helpers - volume                                                  |
+//+------------------------------------------------------------------+
 double NormalizeVolume(double v)
   {
    double minv = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
@@ -304,10 +450,10 @@ double NormalizeVolume(double v)
       step = 0.01;
 
    v = MathFloor(v/step) * step;
-   if(v < minv)
-      v = minv;
    if(v > maxv)
       v = maxv;
+   if(v < minv)
+      v = 0.0;      // below the broker minimum is not tradeable, not "round up"
 
    int digits = 0;
    double s = step;
@@ -319,9 +465,9 @@ double NormalizeVolume(double v)
    return NormalizeDouble(v,digits);
   }
 
-double LotsForRisk(const double stopDistance)
+double LotsForRisk(const double stopDistance,const double riskMoney)
   {
-   if(stopDistance <= 0.0)
+   if(stopDistance <= 0.0 || riskMoney <= 0.0)
       return 0.0;
 
    double tickValue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
@@ -332,12 +478,9 @@ double LotsForRisk(const double stopDistance)
    double lossPerLot = (stopDistance / tickSize) * tickValue;
    if(lossPerLot <= 0.0)
       return 0.0;
-
-   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * InpRiskPercent / 100.0;
    return riskMoney / lossPerLot;
   }
 
-// Push the stop far enough away to satisfy the broker's minimum stop distance.
 double ClampStopBelow(const double entry,double sl)
   {
    long   stopsLevel = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
@@ -347,6 +490,17 @@ double ClampStopBelow(const double entry,double sl)
    if(entry - sl < minDist)
       sl = entry - minDist;
    return NormalizeDouble(sl,_Digits);
+  }
+
+void ResetTradeState()
+  {
+   g_plannedLots  = 0.0;
+   g_entryPrice   = 0.0;
+   g_riskDist     = 0.0;
+   g_initialStop  = 0.0;
+   g_addsDone     = 0;
+   g_secondHalfOn = false;
+   g_entryBarTime = 0;
   }
 
 //+------------------------------------------------------------------+
@@ -359,9 +513,9 @@ int OnInit()
       Print("Invalid MA periods: fast must be >=1 and smaller than slow.");
       return INIT_PARAMETERS_INCORRECT;
      }
-   if(InpPivotLeft < 1 || InpPivotRight < 1)
+   if(InpLevelSource == LEVEL_RANGE_HIGH && (InpRangeBars < 2 || InpMinTouches < 1 || InpMaxRangeATR <= 0.0))
      {
-      Print("Pivot left/right bars must be >= 1.");
+      Print("Range detection needs RangeBars >= 2, MinTouches >= 1 and MaxRangeATR > 0.");
       return INIT_PARAMETERS_INCORRECT;
      }
    if(InpWindowMinutes < 1 || InpWindowMinutes > 1440)
@@ -369,30 +523,21 @@ int OnInit()
       Print("Window length must be between 1 and 1440 minutes.");
       return INIT_PARAMETERS_INCORRECT;
      }
-   if(InpLevelSource == LEVEL_RANGE_HIGH && (InpRangeBars < 2 || InpMinTouches < 1 || InpMaxRangeATR <= 0.0))
+   if(InpInitialPct <= 0.0 || InpInitialPct > 100.0)
      {
-      Print("Range detection needs RangeBars >= 2, MinTouches >= 1 and MaxRangeATR > 0.");
-      return INIT_PARAMETERS_INCORRECT;
-     }
-   if(InpLotMode == LOT_RISK_PCT && InpStopMode == SL_NONE)
-     {
-      Print("Risk-percent sizing needs a stop loss. Choose a StopMode or switch to fixed lots.");
+      Print("Initial slice must be between 0 and 100 percent of the planned size.");
       return INIT_PARAMETERS_INCORRECT;
      }
 
    g_hFast = iMA(_Symbol,_Period,InpFastPeriod,0,InpMaMethod,InpMaPrice);
    g_hSlow = iMA(_Symbol,_Period,InpSlowPeriod,0,InpMaMethod,InpMaPrice);
-   if(g_hFast == INVALID_HANDLE || g_hSlow == INVALID_HANDLE)
-     {
-      Print("Failed to create MA handles.");
-      return INIT_FAILED;
-     }
+   g_hExt  = iMA(_Symbol,_Period,InpExtMaPeriod,0,InpExtMaMethod,PRICE_CLOSE);
+   g_hAtr  = iATR(_Symbol,_Period,InpAtrPeriod);
 
-   // ATR is needed by the range test as well as by SL_ATR, so always create it.
-   g_hAtr = iATR(_Symbol,_Period,InpAtrPeriod);
-   if(g_hAtr == INVALID_HANDLE)
+   if(g_hFast == INVALID_HANDLE || g_hSlow == INVALID_HANDLE ||
+      g_hExt == INVALID_HANDLE || g_hAtr == INVALID_HANDLE)
      {
-      Print("Failed to create ATR handle.");
+      Print("Failed to create an indicator handle.");
       return INIT_FAILED;
      }
 
@@ -407,18 +552,15 @@ int OnInit()
                ((g_windowStartMin+InpWindowMinutes)%1440)/60,
                ((g_windowStartMin+InpWindowMinutes)%1440)%60,
                InpWindowMinutes);
-
    return INIT_SUCCEEDED;
   }
 
 void OnDeinit(const int reason)
   {
-   if(g_hFast != INVALID_HANDLE)
-      IndicatorRelease(g_hFast);
-   if(g_hSlow != INVALID_HANDLE)
-      IndicatorRelease(g_hSlow);
-   if(g_hAtr != INVALID_HANDLE)
-      IndicatorRelease(g_hAtr);
+   if(g_hFast != INVALID_HANDLE) IndicatorRelease(g_hFast);
+   if(g_hSlow != INVALID_HANDLE) IndicatorRelease(g_hSlow);
+   if(g_hExt  != INVALID_HANDLE) IndicatorRelease(g_hExt);
+   if(g_hAtr  != INVALID_HANDLE) IndicatorRelease(g_hAtr);
    Comment("");
   }
 
@@ -436,10 +578,11 @@ void OnTick()
       g_tradeDay       = dt.day;
       g_tradesToday    = 0;
       g_lastUsedLevel  = 0.0;
-      g_windowStartMin = ResolveWindowStartMinutes(now);   // re-resolved once a day (DST)
+      g_openChecked    = false;
+      g_dayOpenMult    = 1.0;
+      g_windowStartMin = ResolveWindowStartMinutes(now);
      }
 
-   // Enough history for whichever level source is active, plus the ATR warm-up.
    int needPivot = InpPivotLeft + InpPivotRight + InpPivotScanBars;
    int needRange = InpRangeBars + InpAtrPeriod;
    int need      = MathMax(needPivot,needRange) + 10;
@@ -456,14 +599,12 @@ void OnTick()
    double fast[], slow[];
    ArraySetAsSeries(fast,true);
    ArraySetAsSeries(slow,true);
-   if(CopyBuffer(g_hFast,0,0,3,fast) < 3)
-      return;
-   if(CopyBuffer(g_hSlow,0,0,3,slow) < 3)
-      return;
+   if(CopyBuffer(g_hFast,0,0,3,fast) < 3) return;
+   if(CopyBuffer(g_hSlow,0,0,3,slow) < 3) return;
 
    if(g_lastBarTime == 0)
      {
-      g_lastBarTime = rates[0].time;   // first tick after attach: sync, never trade off history
+      g_lastBarTime = rates[0].time;
       return;
      }
 
@@ -477,8 +618,52 @@ void OnTick()
    if(CopyBuffer(g_hAtr,0,0,3,atrBuf) >= 3)
       atrVal = atrBuf[1];
 
-   // On a confirmed break the range must EXCLUDE the breakout bar, otherwise the
-   // bar's own high defines the ceiling and nothing can ever exceed it.
+   double posVolume, posAvgPrice;
+   int    posCount;
+   bool   hasPosition = GetPositionAggregate(posVolume,posAvgPrice,posCount);
+
+   //--- Extension gates, refreshed once per bar --------------------------------
+   if(newBar)
+     {
+      if(InpUseExtFilter)
+        {
+         double rank, pct;
+         if(ExtensionRank(g_hExt,InpExtLookback,rank,pct))
+           {
+            g_extReady = true;
+            g_extRank  = rank;
+            g_extPct   = pct;
+            // Only a stretch ABOVE the long MA argues against a fresh long.
+            g_extMult = (pct <= 0.0)
+                        ? 1.0
+                        : RankToMultiplier(rank,pct,InpExtWarnRank,InpExtExtremeRank,
+                                           InpExtWarnMult,InpExtFloorPct);
+           }
+        }
+      else
+         g_extMult = 1.0;
+
+      // "Price opened above the 9 MA but by the first 5-minute close it is
+      // already too far" - measured once, at the close of the first window bar.
+      if(InpUseOpenCheck && !g_openChecked && InTradingWindow(rates[1].time))
+        {
+         g_openChecked = true;
+         if(rates[1].close > fast[1])
+           {
+            double rank9, pct9;
+            if(ExtensionRank(g_hFast,InpExtLookback,rank9,pct9))
+              {
+               g_openRank    = rank9;
+               g_dayOpenMult = RankToMultiplier(rank9,pct9,InpOpenWarnRank,InpOpenExtremeRank,
+                                                InpOpenWarnMult,InpExtFloorPct);
+              }
+           }
+         else
+            g_dayOpenMult = 1.0;   // opened below the 9 MA: this gate does not apply
+        }
+     }
+
+   //--- Range / level ----------------------------------------------------------
    int rangeStart = (InpBreakMode == BREAK_ON_CLOSE) ? 2 : 1;
    RangeInfo rng;
    DetectRange(rates,rangeStart,atrVal,rng);
@@ -486,46 +671,59 @@ void OnTick()
    double levelNow  = 0.0;
    double levelPrev = 0.0;
    if(InpLevelSource == LEVEL_RANGE_HIGH)
-      levelNow = rng.valid ? rng.high : 0.0;   // no valid range => no level => no trade
+      levelNow = rng.valid ? rng.high : 0.0;
    else
      {
       levelNow  = FindLastPivotHigh(rates,InpPivotRight+1,InpPivotLeft,InpPivotRight,InpPivotScanBars);
       levelPrev = FindLastPivotHigh(rates,InpPivotRight+2,InpPivotLeft,InpPivotRight,InpPivotScanBars);
      }
 
-   ulong ticket = 0;
-   bool  hasPosition = GetOpenPosition(ticket);
-
-   //--- 1. Exits are evaluated first, and are NOT restricted to the window.
+   //--- 1. Exit, never restricted to the window --------------------------------
    if(newBar && hasPosition)
      {
-      double exitLevel = fast[1] - InpExitBufferPts * _Point;
-      if(rates[1].close < exitLevel)
+      if(rates[1].close < fast[1] - InpExitBufferPts * _Point)
         {
-         g_trade.PositionClose(ticket);
-         hasPosition = GetOpenPosition(ticket);
+         CloseAllPositions();
+         ResetTradeState();
+         hasPosition = GetPositionAggregate(posVolume,posAvgPrice,posCount);
         }
      }
 
    if(hasPosition && InpCloseAtWindowEnd && !inWindow)
      {
-      g_trade.PositionClose(ticket);
-      hasPosition = GetOpenPosition(ticket);
+      CloseAllPositions();
+      ResetTradeState();
+      hasPosition = GetPositionAggregate(posVolume,posAvgPrice,posCount);
      }
 
-   //--- 2. Entry
+   //--- 2. Scale-in and pyramiding on the live trade ---------------------------
+   if(newBar && hasPosition && g_plannedLots > 0.0)
+      ManageOpenTrade(rates);
+
    if(newBar)
       g_lastBarTime = rates[0].time;
 
-   if(hasPosition || !inWindow || levelNow <= 0.0)
+   if(hasPosition)
      {
-      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,posVolume,rng);
       return;
      }
 
+   // Flat: any leftover state belongs to a trade that is already gone.
+   if(g_plannedLots > 0.0)
+      ResetTradeState();
+
+   //--- 3. Entry ---------------------------------------------------------------
+   double sizeMult = MathMin(g_extMult,g_dayOpenMult);
+
+   if(!inWindow || levelNow <= 0.0 || sizeMult <= 0.0)
+     {
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,0.0,rng);
+      return;
+     }
    if(InpMaxTradesPerDay > 0 && g_tradesToday >= InpMaxTradesPerDay)
      {
-      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,0.0,rng);
       return;
      }
 
@@ -533,30 +731,24 @@ void OnTick()
    if(InpOneEntryPerLevel && g_lastUsedLevel > 0.0 &&
       MathAbs(levelNow - g_lastUsedLevel) < sameLevelTol)
      {
-      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,0.0,rng);
       return;
      }
 
-   if(InpMaxSpreadPts > 0)
+   if(InpMaxSpreadPts > 0 && SymbolInfoInteger(_Symbol,SYMBOL_SPREAD) > InpMaxSpreadPts)
      {
-      long spread = SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
-      if(spread > InpMaxSpreadPts)
-        {
-         UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
-         return;
-        }
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,0.0,rng);
+      return;
      }
 
-   // The 9 > 20 filter, read on the last closed bar.
-   bool maFilter = (fast[1] > slow[1]);
+   bool maFilter   = (fast[1] > slow[1]);
+   bool greenBreak = (!InpRequireGreenBreak || rates[1].close > rates[1].open);
 
    bool signal = false;
    if(InpLevelSource == LEVEL_RANGE_HIGH)
      {
-      // The range window sits entirely behind the trigger, so any break of the
-      // ceiling is by construction a fresh one - no cross bookkeeping needed.
       if(InpBreakMode == BREAK_ON_CLOSE)
-         signal = (newBar && maFilter && rates[1].close > levelNow + buffer);
+         signal = (newBar && maFilter && greenBreak && rates[1].close > levelNow + buffer);
       else
         {
          double askR = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
@@ -565,129 +757,180 @@ void OnTick()
      }
    else if(InpBreakMode == BREAK_ON_CLOSE)
      {
-      // Fresh cross: this bar closed above the level, the one before did not.
-      if(newBar && maFilter && levelPrev > 0.0)
+      if(newBar && maFilter && greenBreak && levelPrev > 0.0)
          signal = (rates[1].close > levelNow + buffer && rates[2].close <= levelPrev + buffer);
      }
    else
      {
-      // Intrabar: last close was still under the level, price is now through it.
       double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
       if(maFilter && rates[1].close <= levelNow + buffer && ask > levelNow + buffer)
          signal = true;
      }
 
    if(signal)
-      OpenLong(rates,levelNow,rng.low);
+      OpenInitial(rates,levelNow,rng,atrVal,sizeMult);
 
-   UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
+   UpdatePanel(fast[1],slow[1],levelNow,inWindow,0.0,rng);
   }
 
 //+------------------------------------------------------------------+
-//| Entry                                                             |
+//| Entry - first slice                                               |
 //+------------------------------------------------------------------+
-void OpenLong(const MqlRates &rates[],const double level,const double rangeLow)
+void OpenInitial(const MqlRates &rates[],const double level,const RangeInfo &rng,
+                 const double atrVal,const double sizeMult)
   {
    double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    if(ask <= 0.0)
       return;
 
-   //--- stop loss
+   //--- stop
+   double swingLow = rates[1].low;
+   int    n        = MathMax(1,MathMin(InpSwingLookback,ArraySize(rates)-1));
+   for(int i=1; i<=n; i++)
+      swingLow = MathMin(swingLow,rates[i].low);
+
    double sl = 0.0;
    switch(InpStopMode)
      {
-      case SL_SWING_LOW:
-        {
-         int    n  = MathMax(1,MathMin(InpSwingLookback,ArraySize(rates)-1));
-         double lo = rates[1].low;
-         for(int i=1; i<=n; i++)
-            lo = MathMin(lo,rates[i].low);
-         sl = lo - InpSwingPadPts * _Point;
-         break;
-        }
-      case SL_ATR:
-        {
-         double atr[];
-         ArraySetAsSeries(atr,true);
-         if(CopyBuffer(g_hAtr,0,0,2,atr) < 2 || atr[1] <= 0.0)
-            return;
-         sl = ask - InpAtrMult * atr[1];
-         break;
-        }
       case SL_RANGE_LOW:
-        {
-         if(rangeLow > 0.0)
-            sl = rangeLow - InpRangePadPts * _Point;
-         else
-           {
-            // Pivot mode, or no valid range: fall back to the swing low.
-            int    n  = MathMax(1,MathMin(InpSwingLookback,ArraySize(rates)-1));
-            double lo = rates[1].low;
-            for(int i=1; i<=n; i++)
-               lo = MathMin(lo,rates[i].low);
-            sl = lo - InpSwingPadPts * _Point;
-           }
+         sl = (rng.valid ? rng.low : swingLow) - InpStopPadPts * _Point;
          break;
-        }
+      case SL_SWING_LOW:
+         sl = swingLow - InpStopPadPts * _Point;
+         break;
+      case SL_ATR:
+         if(atrVal <= 0.0)
+            return;
+         sl = ask - InpAtrMult * atrVal;
+         break;
       case SL_POINTS:
          sl = ask - InpStopPoints * _Point;
          break;
-      case SL_NONE:
-      default:
-         sl = 0.0;
-         break;
      }
 
-   if(sl > 0.0)
+   if(sl >= ask)
      {
-      if(sl >= ask)
-        {
-         Print("Computed stop is above entry - skipping this signal.");
-         return;
-        }
-      sl = ClampStopBelow(ask,sl);
+      Print("Computed stop is at or above entry - skipping this signal.");
+      return;
      }
+   sl = ClampStopBelow(ask,sl);
+   double riskDist = ask - sl;
 
-   //--- take profit (R multiple of the actual stop distance)
-   double tp = 0.0;
-   if(InpTakeProfitR > 0.0 && sl > 0.0)
-      tp = NormalizeDouble(ask + (ask - sl) * InpTakeProfitR,_Digits);
-
-   //--- volume
-   double lots = InpFixedLots;
+   //--- full planned size, then the extension gates scale it
+   double planned = 0.0;
    if(InpLotMode == LOT_RISK_PCT)
      {
-      lots = LotsForRisk(ask - sl);
-      if(lots <= 0.0)
-        {
-         Print("Risk sizing produced zero lots - skipping this signal.");
-         return;
-        }
+      double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPercent / 100.0;
+      planned = LotsForRisk(riskDist,riskMoney);
      }
-   lots = NormalizeVolume(lots);
-   if(lots <= 0.0)
-      return;
+   else
+      planned = InpFixedLots;
 
-   if(!g_trade.Buy(lots,_Symbol,0.0,sl,tp,"GT breakout"))
+   planned *= sizeMult;
+   planned  = NormalizeVolume(planned);
+   if(planned <= 0.0)
+     {
+      Print("Planned size rounds below the broker minimum - skipping this signal.");
+      return;
+     }
+
+   //--- first slice
+   double firstSlice = NormalizeVolume(planned * InpInitialPct / 100.0);
+   bool   splitOk    = (firstSlice > 0.0 && firstSlice < planned);
+   if(!splitOk)
+     {
+      // Half would round below the minimum lot, so the split is not possible.
+      firstSlice = planned;
+     }
+
+   if(!g_trade.Buy(firstSlice,_Symbol,0.0,sl,0.0,"GT entry"))
      {
       PrintFormat("Buy failed: retcode=%d %s",g_trade.ResultRetcode(),g_trade.ResultRetcodeDescription());
       return;
      }
 
+   g_plannedLots   = planned;
+   g_entryPrice    = ask;
+   g_initialStop   = sl;
+   g_riskDist      = riskDist;
+   g_addsDone      = 0;
+   g_secondHalfOn  = !splitOk;          // no split possible -> nothing left to add
+   g_entryBarTime  = rates[0].time;     // the bar we are now trading inside
    g_tradesToday++;
    g_lastUsedLevel = level;
-   PrintFormat("Long %s lots. Resistance %s, SL %s, TP %s",
-               DoubleToString(lots,2),
-               DoubleToString(level,_Digits),
-               sl > 0.0 ? DoubleToString(sl,_Digits) : "none",
-               tp > 0.0 ? DoubleToString(tp,_Digits) : "none");
+
+   PrintFormat("Entry %s of planned %s lots @ %s | stop %s (1R = %s) | size x%s",
+               DoubleToString(firstSlice,2), DoubleToString(planned,2),
+               DoubleToString(ask,_Digits), DoubleToString(sl,_Digits),
+               DoubleToString(riskDist,_Digits), DoubleToString(sizeMult,2));
+  }
+
+//+------------------------------------------------------------------+
+//| Manage a live trade: green-candle half, then +1R adds             |
+//+------------------------------------------------------------------+
+void ManageOpenTrade(const MqlRates &rates[])
+  {
+   double posVolume, posAvgPrice;
+   int    posCount;
+   if(!GetPositionAggregate(posVolume,posAvgPrice,posCount))
+      return;
+
+   //--- (a) the other half, if the FIRST bar we were in the trade closed green.
+   //    rates[1] is that bar exactly when its open time matches the entry bar.
+   if(!g_secondHalfOn && InpAddOnGreen)
+     {
+      if(rates[1].time == g_entryBarTime)
+        {
+         g_secondHalfOn = true;                       // this chance happens once
+         if(rates[1].close > rates[1].open)
+           {
+            double rest = NormalizeVolume(g_plannedLots - posVolume);
+            if(rest > 0.0)
+              {
+               if(g_trade.Buy(rest,_Symbol,0.0,g_initialStop,0.0,"GT green add"))
+                  PrintFormat("Green-candle add: %s lots (planned %s)",
+                              DoubleToString(rest,2), DoubleToString(g_plannedLots,2));
+              }
+           }
+         else
+            Print("First bar in the trade closed red - second half skipped.");
+        }
+      else
+         if(rates[1].time > g_entryBarTime)
+            g_secondHalfOn = true;                    // missed the window, do not add late
+     }
+
+   //--- (b) +1R adds while the trade keeps working
+   if(!InpPyramid || g_addsDone >= InpMaxAdds || g_riskDist <= 0.0)
+      return;
+
+   double target = g_entryPrice + (g_addsDone + 1) * g_riskDist;
+   if(rates[1].close < target)
+      return;
+
+   double slice = NormalizeVolume(g_plannedLots * InpPyramidPct / 100.0);
+   if(slice <= 0.0)
+      return;
+
+   double sl = g_initialStop;
+   if(InpBreakEvenOnAdd)
+      sl = ClampStopBelow(SymbolInfoDouble(_Symbol,SYMBOL_BID),g_entryPrice);
+
+   if(g_trade.Buy(slice,_Symbol,0.0,sl,0.0,"GT +1R add"))
+     {
+      g_addsDone++;
+      if(InpBreakEvenOnAdd)
+         SetStopOnAll(sl);
+      PrintFormat("+%dR add: %s lots, stop now %s",
+                  g_addsDone, DoubleToString(slice,2), DoubleToString(sl,_Digits));
+     }
   }
 
 //+------------------------------------------------------------------+
 //| Status panel                                                      |
 //+------------------------------------------------------------------+
 void UpdatePanel(const double fast,const double slow,const double level,
-                 const bool inWindow,const bool hasPosition,const RangeInfo &rng)
+                 const bool inWindow,const double posVolume,const RangeInfo &rng)
   {
    if(!InpShowPanel)
       return;
@@ -701,13 +944,19 @@ void UpdatePanel(const double fast,const double slow,const double level,
       if(rng.height <= 0.0)
          rangeTxt = "no data";
       else
-         rangeTxt = StringFormat("%s - %s | %s ATR (max %s) | %d touch%s | %s",
-                                 DoubleToString(rng.low,_Digits),
-                                 DoubleToString(rng.high,_Digits),
-                                 DoubleToString(rng.heightAtr,2),
-                                 DoubleToString(InpMaxRangeATR,2),
+         rangeTxt = StringFormat("%s ATR (max %s) | %d touch%s | %s",
+                                 DoubleToString(rng.heightAtr,2), DoubleToString(InpMaxRangeATR,2),
                                  rng.touches, rng.touches == 1 ? "" : "es",
                                  rng.valid ? "VALID" : "rejected");
+
+   double sizeMult = MathMin(g_extMult,g_dayOpenMult);
+   string gateTxt  = sizeMult <= 0.0 ? "NO TRADE" : StringFormat("x%s", DoubleToString(sizeMult,2));
+
+   string tradeTxt = posVolume > 0.0
+                     ? StringFormat("LONG %s / planned %s | adds %d/%d",
+                                    DoubleToString(posVolume,2), DoubleToString(g_plannedLots,2),
+                                    g_addsDone, InpMaxAdds)
+                     : "flat";
 
    string txt = StringFormat(
                    "Gold Trades Breakout EA\n"
@@ -715,6 +964,9 @@ void UpdatePanel(const double fast,const double slow,const double level,
                    "MA %d/%d  : %s / %s  [%s]\n"
                    "Range    : %s\n"
                    "Resistance: %s\n"
+                   "Ext %d MA : %s  ->  x%s\n"
+                   "Day open : p%s  ->  x%s\n"
+                   "Size gate: %s\n"
                    "Position : %s   Trades today: %d",
                    g_windowStartMin/60, g_windowStartMin%60, endMin/60, endMin%60,
                    inWindow ? "OPEN" : "closed",
@@ -723,8 +975,13 @@ void UpdatePanel(const double fast,const double slow,const double level,
                    fast > slow ? "9 > 20 OK" : "blocked",
                    rangeTxt,
                    level > 0.0 ? DoubleToString(level,_Digits) : "none found",
-                   hasPosition ? "LONG" : "flat",
-                   g_tradesToday);
+                   InpExtMaPeriod,
+                   g_extReady ? StringFormat("p%s (%s%%)", DoubleToString(g_extRank,0), DoubleToString(g_extPct,2))
+                              : "n/a - warming up",
+                   DoubleToString(g_extMult,2),
+                   DoubleToString(g_openRank,0), DoubleToString(g_dayOpenMult,2),
+                   gateTxt,
+                   tradeTxt, g_tradesToday);
    Comment(txt);
   }
 //+------------------------------------------------------------------+

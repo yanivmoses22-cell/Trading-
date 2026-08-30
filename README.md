@@ -9,6 +9,9 @@ trading rules behind the **Gold Trades** Pine indicator.
 |---|---|
 | **Entry** | Price breaks above the **ceiling of a validated consolidation range** |
 | **Filter** | Fast MA (9) must be **above** the slow MA (20), read on the closed bar |
+| **Size** | Risk % of equity against the stop, then scaled by two extension gates |
+| **Fill** | 50% on the breakout, the other 50% if the first bar in the trade closes green |
+| **Adds** | A further slice at each +1R, capped |
 | **Exit** | The bar **closes under the 9 MA** |
 | **Direction** | Long only |
 | **Window** | Entries only during the first 2 hours of the New York session (09:30–11:30 ET) |
@@ -57,6 +60,67 @@ bases. Every one of these makes the EA more selective.
 Set `InpLevelSource = LEVEL_PIVOT_HIGH` to go back to the plain swing-high
 breakout with no range requirement.
 
+## The two extension gates
+
+Both answer the same question — *is price already stretched?* — and both are
+measured as a **percentile against their own recent history**, not as a fixed
+percentage. A fixed % cannot work on two timeframes at once: price sits far
+closer to a 150 MA on M5 than on D1, so "2% is extended" is meaningless without
+retuning per chart. A percentile is self-calibrating.
+
+Each gate returns a size multiplier, and the **more restrictive one wins**:
+
+| Percentile | Multiplier | Meaning |
+|---|---|---|
+| below 70 | ×1.0 | normal, full planned size |
+| 70–90 | ×0.5 | stretched, half size |
+| 90+ | ×0.0 | too extended, no trade |
+
+**Gate 1 — stretch from the 150 MA** (`InpUseExtFilter`). Ranked over the last
+500 bars. Only a stretch *above* the MA counts against a long; if price is below
+the 150 MA the gate passes at ×1.0, since being below it is not a reason to
+refuse an upside breakout.
+
+**Gate 2 — day open versus the 9 MA** (`InpUseOpenCheck`). Evaluated **once a
+day, at the close of the first bar of the window**. On an M5 chart that is
+literally "once the 5-minute closes". If price is above the 9 MA at that close
+and the stretch ranks high, the multiplier applies **for the whole day**. If
+price opened below the 9 MA the gate does not apply.
+
+Both gates need history to warm up. Until then they report `n/a` on the panel
+and pass at ×1.0 — they do not silently block trades.
+
+## Sizing, scale-in and pyramiding
+
+**Base size** is dynamic: `(risk% × equity) ÷ distance to the stop`. A wide range
+gives a smaller position, a tight one a bigger position, and every trade risks the
+same money. The extension gates then cut that by half or to zero.
+
+**The split.** The breakout bar is the green candle you enter on. The very next
+bar is your first bar in the trade — if *it* closes green, the remaining 50% goes
+on. If it closes red the second half is skipped permanently; the EA never adds it
+late.
+
+**The +1R adds.** Each time price gains another multiple of the original stop
+distance, a slice worth 50% of the planned size is added, up to `InpMaxAdds`.
+
+### Read this before turning off breakeven-on-add
+
+Adding at +1R with the original stop untouched roughly **doubles** your risk on a
+trade that was already working:
+
+- Full position `P`, stop distance `D`. Original risk `P × D` = **1R**.
+- At +1R you add `0.5P`. That slice sits `2D` above the stop, so it carries
+  `0.5P × 2D` = **1R** of risk by itself.
+- Stopped out now, you lose **2R** — after being up 1R.
+
+`InpBreakEvenOnAdd` (default **on**) moves the stop to your entry on the first
+add, which caps total open risk near 0.5R. Leave it on unless you have a reason
+not to, and compare max drawdown both ways in the tester before you decide.
+
+If the planned size is small enough that half of it rounds below your broker's
+minimum lot, the EA takes the whole planned size at once rather than splitting.
+
 ## Setting the trading window
 
 The EA converts 09:30 New York time into your broker's server time, so it stays
@@ -98,16 +162,16 @@ The rules as you described them have no stop; the only exit is the close under
 the 9 MA. That leaves an open trade unprotected through a gap or a disconnect,
 so `InpStopMode` defaults to **`SL_RANGE_LOW`** — just under the floor of the box
 you just broke out of, which is the natural invalidation for a range breakout.
-This is an addition on my part, not part of your rules — **set
-`InpStopMode = SL_NONE` if you want backtests that match your rules exactly.**
-`SL_SWING_LOW`, `SL_ATR` and `SL_POINTS` are also available.
+A stop is now structural rather than optional: risk-based sizing and the +1R add
+spacing are both measured in units of the stop distance, so there is no longer a
+"no stop" mode. `SL_SWING_LOW`, `SL_ATR` and `SL_POINTS` are the alternatives.
 
 `InpTakeProfitR` is off by default (`0`), so the MA close is the only exit.
 
-**Sizing**
-- `LOT_FIXED` *(default)* uses `InpFixedLots`.
-- `LOT_RISK_PCT` risks `InpRiskPercent` of balance against the stop distance —
-  requires a stop mode other than `SL_NONE`.
+**Sizing / scale-in** — `InpRiskPercent`, `InpInitialPct`, `InpAddOnGreen`,
+`InpPyramid`, `InpPyramidPct`, `InpMaxAdds`, `InpBreakEvenOnAdd`; see above.
+`InpLotMode = LOT_FIXED` swaps the risk-based base size for a flat lot, which the
+gates still scale.
 
 **Housekeeping**
 `InpMaxTradesPerDay` (0 = unlimited), `InpMaxSpreadPts` (0 = off),
@@ -128,6 +192,18 @@ over. Two deliberate differences:
 - The indicator has no concept of a range at all; its entry dots fire on any
   swing-high cross. The range tests above are new, and are what make the EA
   selective in the way the manual process is.
+
+## Reading the backtest now that sizing varies
+
+Scaling in makes win rate *less* informative, not more. A trade that took the
+green add and three +1R adds is a completely different bet from one that got half
+size on a warn-band day and stopped out. Compare **Net Profit** and **Max
+Drawdown** across settings; win rate on its own will mislead you here.
+
+Also watch the trade count. A two-hour window, a validated-range requirement and
+two extension gates stack multiplicatively — it is easy to filter your way down
+to a dozen trades and a beautiful, meaningless equity curve. Check the count
+before concluding a gate helped.
 
 ## Before running it live
 
