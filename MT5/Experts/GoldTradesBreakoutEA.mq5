@@ -17,8 +17,8 @@
 //+------------------------------------------------------------------+
 #property copyright "Gold Trades"
 #property link      ""
-#property version   "1.00"
-#property description "Long-only breakout of last pivot high, filtered by 9>20 MA, exit on close under the 9 MA, first two hours of the NY session."
+#property version   "1.10"
+#property description "Long-only breakout of a validated consolidation range, filtered by 9>20 MA, exit on close under the 9 MA, first two hours of the NY session."
 
 #include <Trade\Trade.mqh>
 
@@ -36,7 +36,14 @@ enum ENUM_SL_MODE
    SL_NONE       = 0,    // No stop (pure "exit on close under 9 MA")
    SL_SWING_LOW  = 1,    // Below the lowest low of the last N bars
    SL_ATR        = 2,    // ATR multiple below entry
-   SL_POINTS     = 3     // Fixed distance in points
+   SL_POINTS     = 3,    // Fixed distance in points
+   SL_RANGE_LOW  = 4     // Below the floor of the broken range
+  };
+
+enum ENUM_LEVEL_SOURCE
+  {
+   LEVEL_RANGE_HIGH = 0, // Ceiling of a validated consolidation range
+   LEVEL_PIVOT_HIGH = 1  // Last confirmed swing high (no range required)
   };
 
 enum ENUM_LOT_MODE
@@ -54,7 +61,16 @@ input int                InpSlowPeriod      = 20;            // Slow MA period (
 input ENUM_MA_METHOD     InpMaMethod        = MODE_EMA;      // MA method
 input ENUM_APPLIED_PRICE InpMaPrice         = PRICE_CLOSE;   // MA applied price
 
-input group "=== Resistance (pivot high) ==="
+input group "=== What counts as resistance ==="
+input ENUM_LEVEL_SOURCE InpLevelSource = LEVEL_RANGE_HIGH; // Level the EA trades the break of
+
+input group "=== Range detection (LEVEL_RANGE_HIGH) ==="
+input int    InpRangeBars    = 20;    // Bars that must form the range
+input double InpMaxRangeATR  = 3.0;   // Max range height, in ATR (lower = tighter, rarer)
+input int    InpMinTouches   = 2;     // Times the ceiling must have been tested
+input double InpTouchTolATR  = 0.15;  // How close to the ceiling counts as a touch (ATR)
+
+input group "=== Pivot high (LEVEL_PIVOT_HIGH) ==="
 input int             InpPivotLeft      = 5;      // Pivot high - left bars
 input int             InpPivotRight     = 5;      // Pivot high - right bars (confirmation delay)
 input int             InpPivotScanBars  = 300;    // How far back to look for the last pivot
@@ -75,11 +91,12 @@ input group "=== Exit ==="
 input double InpExitBufferPts      = 0;      // Close only if bar closes this far under the 9 MA (points)
 
 input group "=== Risk / stops ==="
-input ENUM_SL_MODE InpStopMode     = SL_SWING_LOW; // Protective stop mode
+input ENUM_SL_MODE InpStopMode     = SL_RANGE_LOW; // Protective stop mode
 input int          InpSwingLookback= 10;     // SL_SWING_LOW: bars used for the swing low
 input double       InpSwingPadPts  = 20;     // SL_SWING_LOW: pad below the swing low (points)
-input int          InpAtrPeriod    = 14;     // SL_ATR: ATR period
+input int          InpAtrPeriod    = 14;     // ATR period (range test, SL_ATR)
 input double       InpAtrMult      = 1.5;    // SL_ATR: ATR multiple
+input double       InpRangePadPts  = 20;     // SL_RANGE_LOW: pad below the range floor (points)
 input double       InpStopPoints   = 500;    // SL_POINTS: stop distance in points
 input double       InpTakeProfitR  = 0;      // Take profit as R multiple (0 = none, exit on MA only)
 
@@ -204,6 +221,60 @@ double FindLastPivotHigh(const MqlRates &r[],const int startShift,const int left
   }
 
 //+------------------------------------------------------------------+
+//| Helpers - range detection                                         |
+//+------------------------------------------------------------------+
+struct RangeInfo
+  {
+   bool              valid;
+   double            high;
+   double            low;
+   double            height;
+   double            heightAtr;
+   int               touches;
+  };
+
+// Look at InpRangeBars bars starting at startShift and decide whether they form a
+// tradeable consolidation: a box that is TIGHT relative to ATR and whose ceiling
+// has been TESTED more than once. A clean trend leg fails the tightness test, which
+// is the whole point - it is what separates a range breakout from a new swing high.
+void DetectRange(const MqlRates &r[],const int startShift,const double atr,RangeInfo &out)
+  {
+   out.valid     = false;
+   out.high      = 0.0;
+   out.low       = 0.0;
+   out.height    = 0.0;
+   out.heightAtr = 0.0;
+   out.touches   = 0;
+
+   int total = ArraySize(r);
+   int last  = startShift + InpRangeBars - 1;
+   if(InpRangeBars < 2 || last >= total || atr <= 0.0)
+      return;
+
+   double hi = r[startShift].high;
+   double lo = r[startShift].low;
+   for(int i=startShift; i<=last; i++)
+     {
+      hi = MathMax(hi,r[i].high);
+      lo = MathMin(lo,r[i].low);
+     }
+
+   out.high   = hi;
+   out.low    = lo;
+   out.height = hi - lo;
+   if(out.height <= 0.0)
+      return;
+   out.heightAtr = out.height / atr;
+
+   double tol = InpTouchTolATR * atr;
+   for(int i=startShift; i<=last; i++)
+      if(r[i].high >= hi - tol)
+         out.touches++;
+
+   out.valid = (out.heightAtr <= InpMaxRangeATR) && (out.touches >= InpMinTouches);
+  }
+
+//+------------------------------------------------------------------+
 //| Helpers - position / orders                                       |
 //+------------------------------------------------------------------+
 bool GetOpenPosition(ulong &ticket)
@@ -298,6 +369,11 @@ int OnInit()
       Print("Window length must be between 1 and 1440 minutes.");
       return INIT_PARAMETERS_INCORRECT;
      }
+   if(InpLevelSource == LEVEL_RANGE_HIGH && (InpRangeBars < 2 || InpMinTouches < 1 || InpMaxRangeATR <= 0.0))
+     {
+      Print("Range detection needs RangeBars >= 2, MinTouches >= 1 and MaxRangeATR > 0.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
    if(InpLotMode == LOT_RISK_PCT && InpStopMode == SL_NONE)
      {
       Print("Risk-percent sizing needs a stop loss. Choose a StopMode or switch to fixed lots.");
@@ -312,14 +388,12 @@ int OnInit()
       return INIT_FAILED;
      }
 
-   if(InpStopMode == SL_ATR)
+   // ATR is needed by the range test as well as by SL_ATR, so always create it.
+   g_hAtr = iATR(_Symbol,_Period,InpAtrPeriod);
+   if(g_hAtr == INVALID_HANDLE)
      {
-      g_hAtr = iATR(_Symbol,_Period,InpAtrPeriod);
-      if(g_hAtr == INVALID_HANDLE)
-        {
-         Print("Failed to create ATR handle.");
-         return INIT_FAILED;
-        }
+      Print("Failed to create ATR handle.");
+      return INIT_FAILED;
      }
 
    g_trade.SetExpertMagicNumber(InpMagic);
@@ -365,11 +439,18 @@ void OnTick()
       g_windowStartMin = ResolveWindowStartMinutes(now);   // re-resolved once a day (DST)
      }
 
-   int need = InpPivotLeft + InpPivotRight + InpPivotScanBars + 10;
+   // Enough history for whichever level source is active, plus the ATR warm-up.
+   int needPivot = InpPivotLeft + InpPivotRight + InpPivotScanBars;
+   int needRange = InpRangeBars + InpAtrPeriod;
+   int need      = MathMax(needPivot,needRange) + 10;
+
    MqlRates rates[];
    ArraySetAsSeries(rates,true);
    int got = CopyRates(_Symbol,_Period,0,need,rates);
-   if(got < InpPivotLeft + InpPivotRight + 5)
+   int minBars = (InpLevelSource == LEVEL_RANGE_HIGH)
+                 ? InpRangeBars + 3
+                 : InpPivotLeft + InpPivotRight + 5;
+   if(got < minBars)
       return;
 
    double fast[], slow[];
@@ -390,8 +471,27 @@ void OnTick()
    bool   inWindow = InTradingWindow(now);
    double buffer   = InpBreakBufferPts * _Point;
 
-   double levelNow  = FindLastPivotHigh(rates,InpPivotRight+1,InpPivotLeft,InpPivotRight,InpPivotScanBars);
-   double levelPrev = FindLastPivotHigh(rates,InpPivotRight+2,InpPivotLeft,InpPivotRight,InpPivotScanBars);
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf,true);
+   double atrVal = 0.0;
+   if(CopyBuffer(g_hAtr,0,0,3,atrBuf) >= 3)
+      atrVal = atrBuf[1];
+
+   // On a confirmed break the range must EXCLUDE the breakout bar, otherwise the
+   // bar's own high defines the ceiling and nothing can ever exceed it.
+   int rangeStart = (InpBreakMode == BREAK_ON_CLOSE) ? 2 : 1;
+   RangeInfo rng;
+   DetectRange(rates,rangeStart,atrVal,rng);
+
+   double levelNow  = 0.0;
+   double levelPrev = 0.0;
+   if(InpLevelSource == LEVEL_RANGE_HIGH)
+      levelNow = rng.valid ? rng.high : 0.0;   // no valid range => no level => no trade
+   else
+     {
+      levelNow  = FindLastPivotHigh(rates,InpPivotRight+1,InpPivotLeft,InpPivotRight,InpPivotScanBars);
+      levelPrev = FindLastPivotHigh(rates,InpPivotRight+2,InpPivotLeft,InpPivotRight,InpPivotScanBars);
+     }
 
    ulong ticket = 0;
    bool  hasPosition = GetOpenPosition(ticket);
@@ -419,20 +519,21 @@ void OnTick()
 
    if(hasPosition || !inWindow || levelNow <= 0.0)
      {
-      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition);
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
       return;
      }
 
    if(InpMaxTradesPerDay > 0 && g_tradesToday >= InpMaxTradesPerDay)
      {
-      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition);
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
       return;
      }
 
+   double sameLevelTol = MathMax(_Point,0.25*atrVal);
    if(InpOneEntryPerLevel && g_lastUsedLevel > 0.0 &&
-      MathAbs(levelNow - g_lastUsedLevel) < _Point)
+      MathAbs(levelNow - g_lastUsedLevel) < sameLevelTol)
      {
-      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition);
+      UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
       return;
      }
 
@@ -441,7 +542,7 @@ void OnTick()
       long spread = SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
       if(spread > InpMaxSpreadPts)
         {
-         UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition);
+         UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
          return;
         }
      }
@@ -450,7 +551,19 @@ void OnTick()
    bool maFilter = (fast[1] > slow[1]);
 
    bool signal = false;
-   if(InpBreakMode == BREAK_ON_CLOSE)
+   if(InpLevelSource == LEVEL_RANGE_HIGH)
+     {
+      // The range window sits entirely behind the trigger, so any break of the
+      // ceiling is by construction a fresh one - no cross bookkeeping needed.
+      if(InpBreakMode == BREAK_ON_CLOSE)
+         signal = (newBar && maFilter && rates[1].close > levelNow + buffer);
+      else
+        {
+         double askR = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+         signal = (maFilter && askR > levelNow + buffer);
+        }
+     }
+   else if(InpBreakMode == BREAK_ON_CLOSE)
      {
       // Fresh cross: this bar closed above the level, the one before did not.
       if(newBar && maFilter && levelPrev > 0.0)
@@ -465,15 +578,15 @@ void OnTick()
      }
 
    if(signal)
-      OpenLong(rates,levelNow);
+      OpenLong(rates,levelNow,rng.low);
 
-   UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition);
+   UpdatePanel(fast[1],slow[1],levelNow,inWindow,hasPosition,rng);
   }
 
 //+------------------------------------------------------------------+
 //| Entry                                                             |
 //+------------------------------------------------------------------+
-void OpenLong(const MqlRates &rates[],const double level)
+void OpenLong(const MqlRates &rates[],const double level,const double rangeLow)
   {
    double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    if(ask <= 0.0)
@@ -499,6 +612,21 @@ void OpenLong(const MqlRates &rates[],const double level)
          if(CopyBuffer(g_hAtr,0,0,2,atr) < 2 || atr[1] <= 0.0)
             return;
          sl = ask - InpAtrMult * atr[1];
+         break;
+        }
+      case SL_RANGE_LOW:
+        {
+         if(rangeLow > 0.0)
+            sl = rangeLow - InpRangePadPts * _Point;
+         else
+           {
+            // Pivot mode, or no valid range: fall back to the swing low.
+            int    n  = MathMax(1,MathMin(InpSwingLookback,ArraySize(rates)-1));
+            double lo = rates[1].low;
+            for(int i=1; i<=n; i++)
+               lo = MathMin(lo,rates[i].low);
+            sl = lo - InpSwingPadPts * _Point;
+           }
          break;
         }
       case SL_POINTS:
@@ -559,16 +687,33 @@ void OpenLong(const MqlRates &rates[],const double level)
 //| Status panel                                                      |
 //+------------------------------------------------------------------+
 void UpdatePanel(const double fast,const double slow,const double level,
-                 const bool inWindow,const bool hasPosition)
+                 const bool inWindow,const bool hasPosition,const RangeInfo &rng)
   {
    if(!InpShowPanel)
       return;
 
    int endMin = (g_windowStartMin + InpWindowMinutes) % 1440;
+
+   string rangeTxt;
+   if(InpLevelSource != LEVEL_RANGE_HIGH)
+      rangeTxt = "pivot-high mode";
+   else
+      if(rng.height <= 0.0)
+         rangeTxt = "no data";
+      else
+         rangeTxt = StringFormat("%s - %s | %s ATR (max %s) | %d touch%s | %s",
+                                 DoubleToString(rng.low,_Digits),
+                                 DoubleToString(rng.high,_Digits),
+                                 DoubleToString(rng.heightAtr,2),
+                                 DoubleToString(InpMaxRangeATR,2),
+                                 rng.touches, rng.touches == 1 ? "" : "es",
+                                 rng.valid ? "VALID" : "rejected");
+
    string txt = StringFormat(
                    "Gold Trades Breakout EA\n"
                    "Window   : %02d:%02d - %02d:%02d server  [%s]\n"
                    "MA %d/%d  : %s / %s  [%s]\n"
+                   "Range    : %s\n"
                    "Resistance: %s\n"
                    "Position : %s   Trades today: %d",
                    g_windowStartMin/60, g_windowStartMin%60, endMin/60, endMin%60,
@@ -576,6 +721,7 @@ void UpdatePanel(const double fast,const double slow,const double level,
                    InpFastPeriod, InpSlowPeriod,
                    DoubleToString(fast,_Digits), DoubleToString(slow,_Digits),
                    fast > slow ? "9 > 20 OK" : "blocked",
+                   rangeTxt,
                    level > 0.0 ? DoubleToString(level,_Digits) : "none found",
                    hasPosition ? "LONG" : "flat",
                    g_tradesToday);
