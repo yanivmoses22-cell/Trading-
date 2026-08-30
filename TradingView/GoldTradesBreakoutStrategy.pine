@@ -1,0 +1,296 @@
+//@version=6
+// =============================================================================
+// Gold Trades - Range Breakout Strategy
+//
+// Backtest twin of MT5/Experts/GoldTradesBreakoutEA.mq5. Same rules, so the win
+// rate you read here is the win rate of the EA:
+//
+//   ENTRY  : close breaks the ceiling of a VALIDATED consolidation range,
+//            while fast MA (9) > slow MA (20)
+//   EXIT   : bar closes under the fast MA (9)
+//   WINDOW : entries only in the first two hours of the NY session
+//   SIDE   : long only
+//
+// A range is only valid if it is tight relative to ATR and its ceiling has been
+// tested more than once - that is the filter that rejects a new high inside a
+// runaway trend, which is not a range breakout.
+//
+// Read the notes at the bottom of this file before you trust any number.
+// =============================================================================
+strategy(title                = "Gold Trades - Range Breakout Strategy",
+         shorttitle           = "GT Range Breakout",
+         overlay              = true,
+         initial_capital      = 10000,
+         default_qty_type     = strategy.percent_of_equity,
+         default_qty_value    = 10,
+         commission_type      = strategy.commission.percent,
+         commission_value     = 0.0,
+         slippage             = 0,
+         pyramiding           = 0,
+         calc_on_every_tick   = false,
+         process_orders_on_close = false,
+         max_boxes_count      = 500,
+         max_labels_count     = 500)
+
+// ── MOVING AVERAGES (the 9 / 20 filter) ──────────────────────────────────────
+grpMa      = "Moving averages (the 9 / 20 filter)"
+maTypeStr  = input.string("EMA", "MA type", options=["EMA","SMA"], group=grpMa)
+fastLen    = input.int(9,  "Fast MA length (the 9)",  minval=1, group=grpMa)
+slowLen    = input.int(20, "Slow MA length (the 20)", minval=1, group=grpMa)
+maSrc      = input.source(close, "MA source", group=grpMa)
+
+// ── WHAT COUNTS AS RESISTANCE ────────────────────────────────────────────────
+grpLevel   = "What counts as resistance"
+levelSrc   = input.string("Range high", "Level the strategy trades the break of",
+     options=["Range high","Pivot high"], group=grpLevel,
+     tooltip="Range high = ceiling of a validated consolidation (the real setup).\nPivot high = any confirmed swing high, no range required - use it to A/B the two.")
+
+// ── RANGE DETECTION ──────────────────────────────────────────────────────────
+grpRange   = "Range detection (Range high mode)"
+rangeBars  = input.int(20,   "Bars that must form the range", minval=2, group=grpRange)
+maxRangeAtr= input.float(3.0,"Max range height, in ATR", step=0.1, minval=0.1, group=grpRange,
+     tooltip="Lower = tighter, rarer setups. A trending leg covers far more than 3 ATR in 20 bars, so it fails here.")
+minTouches = input.int(2,    "Times the ceiling must be tested", minval=1, group=grpRange)
+touchTolAtr= input.float(0.15,"How close to the ceiling counts as a touch (ATR)", step=0.05, minval=0, group=grpRange)
+atrLen     = input.int(14,   "ATR length", minval=1, group=grpRange)
+
+// ── PIVOT HIGH ───────────────────────────────────────────────────────────────
+grpPivot   = "Pivot high (Pivot high mode)"
+pivotLeft  = input.int(5, "Pivot high - left bars",  minval=1, group=grpPivot)
+pivotRight = input.int(5, "Pivot high - right bars", minval=1, group=grpPivot)
+
+// ── BREAKOUT ─────────────────────────────────────────────────────────────────
+grpBreak   = "Breakout"
+breakBufPts= input.float(0, "Buffer above the level (points)", step=1, minval=0, group=grpBreak)
+onePerLevel= input.bool(true, "Only one trade per level", group=grpBreak)
+
+// ── TRADING WINDOW ───────────────────────────────────────────────────────────
+grpSess    = "Trading window"
+useSession = input.bool(true, "Restrict entries to a session window", group=grpSess)
+sessWindow = input.session("0930-1130", "Window", group=grpSess)
+sessTz     = input.string("America/New_York", "Timezone", group=grpSess,
+     tooltip="Pine handles DST for you, so 0930 stays the NY open all year.")
+closeAtEnd = input.bool(false, "Force-close when the window ends", group=grpSess,
+     tooltip="Off = an open trade runs until it closes under the 9 MA, whatever the time.")
+
+// ── EXIT ─────────────────────────────────────────────────────────────────────
+grpExit    = "Exit"
+exitBufPts = input.float(0, "Close only if the bar closes this far under the 9 MA (points)", step=1, minval=0, group=grpExit)
+
+// ── STOP / TARGET ────────────────────────────────────────────────────────────
+grpRisk    = "Stop / target"
+stopMode   = input.string("Range low", "Protective stop",
+     options=["None","Range low","Swing low","ATR","Fixed points"], group=grpRisk,
+     tooltip="'None' matches the raw rules (exit on the 9 MA only). Everything else is a safety addition - it changes the results, so compare.")
+swingLook  = input.int(10,   "Swing low lookback (bars)", minval=1, group=grpRisk)
+stopPadPts = input.float(20, "Pad below range/swing low (points)", step=1, minval=0, group=grpRisk)
+atrMult    = input.float(1.5,"ATR stop multiple", step=0.1, minval=0.1, group=grpRisk)
+stopPts    = input.float(500,"Fixed stop distance (points)", step=10, minval=1, group=grpRisk)
+takeProfitR= input.float(0,  "Take profit as R multiple (0 = none)", step=0.5, minval=0, group=grpRisk)
+
+// ── HOUSEKEEPING ─────────────────────────────────────────────────────────────
+grpMisc    = "Housekeeping"
+maxPerDay  = input.int(0, "Max entries per day (0 = unlimited)", minval=0, group=grpMisc)
+riskSizing = input.bool(false, "Size positions by risk % instead of equity %", group=grpMisc,
+     tooltip="Needs a stop. Makes the equity curve meaningful; win rate is unaffected either way.")
+riskPct    = input.float(1.0, "Risk % of equity per trade", step=0.25, minval=0.01, group=grpMisc)
+showBoxes  = input.bool(true, "Draw the range that was broken", group=grpMisc)
+showStats  = input.bool(true, "Show summary table", group=grpMisc)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+fastMa = maTypeStr == "EMA" ? ta.ema(maSrc, fastLen) : ta.sma(maSrc, fastLen)
+slowMa = maTypeStr == "EMA" ? ta.ema(maSrc, slowLen) : ta.sma(maSrc, slowLen)
+
+// ATR as of the PREVIOUS bar, so the breakout bar's own range cannot inflate the
+// yardstick the range is measured against. Matches the EA.
+atrVal = ta.atr(atrLen)[1]
+
+buffer   = breakBufPts * syminfo.mintick
+exitBuf  = exitBufPts  * syminfo.mintick
+stopPad  = stopPadPts  * syminfo.mintick
+
+// ── Range: the N bars BEHIND the current (breakout) bar ───────────────────────
+// Excluding the current bar is essential - otherwise its own high defines the
+// ceiling and nothing could ever break it.
+rangeHigh = ta.highest(high, rangeBars)[1]
+rangeLow  = ta.lowest(low,   rangeBars)[1]
+rangeHgt  = rangeHigh - rangeLow
+heightAtr = na(atrVal) or atrVal <= 0 ? na : rangeHgt / atrVal
+
+touchTol  = touchTolAtr * nz(atrVal)
+int touches = 0
+for i = 1 to rangeBars
+    if high[i] >= rangeHigh - touchTol
+        touches += 1
+
+rangeValid = not na(atrVal) and atrVal > 0 and rangeHgt > 0 and
+             not na(heightAtr) and heightAtr <= maxRangeAtr and touches >= minTouches
+
+// ── Pivot high (alternative level source) ─────────────────────────────────────
+ph = ta.pivothigh(pivotLeft, pivotRight)
+var float lastPh = na
+if not na(ph)
+    lastPh := ph
+
+usingRange = levelSrc == "Range high"
+level      = usingRange ? (rangeValid ? rangeHigh : na) : lastPh
+
+// ── Session window ────────────────────────────────────────────────────────────
+inSession = not useSession or not na(time(timeframe.period, sessWindow, sessTz))
+
+// ── Per-day bookkeeping ───────────────────────────────────────────────────────
+newDay = ta.change(time("D")) != 0
+var int   tradesToday   = 0
+var float lastUsedLevel = na
+if newDay
+    tradesToday   := 0
+    lastUsedLevel := na
+
+sameLevelTol = math.max(syminfo.mintick, 0.25 * nz(atrVal))
+levelBlocked = onePerLevel and not na(lastUsedLevel) and not na(level) and
+               math.abs(level - lastUsedLevel) < sameLevelTol
+
+// ── Signals ───────────────────────────────────────────────────────────────────
+maFilter = fastMa > slowMa
+flat     = strategy.position_size == 0
+
+breakout = usingRange
+             ? (rangeValid and close > level + buffer)
+             : (not na(lastPh) and ta.crossover(close, lastPh + buffer))
+
+dayCapOk = maxPerDay == 0 or tradesToday < maxPerDay
+
+longSignal = flat and inSession and maFilter and breakout and dayCapOk and
+             not levelBlocked and not na(level) and barstate.isconfirmed
+
+// ── Stop price for this signal ────────────────────────────────────────────────
+swingLow = ta.lowest(low, swingLook)
+float stopPx = na
+if stopMode == "Range low"
+    stopPx := (usingRange and rangeValid ? rangeLow : swingLow) - stopPad
+else if stopMode == "Swing low"
+    stopPx := swingLow - stopPad
+else if stopMode == "ATR"
+    stopPx := close - atrMult * nz(atrVal)
+else if stopMode == "Fixed points"
+    stopPx := close - stopPts * syminfo.mintick
+
+// ── Position sizing ───────────────────────────────────────────────────────────
+riskDist = na(stopPx) ? na : close - stopPx
+qty = riskSizing and not na(riskDist) and riskDist > 0
+        ? (strategy.equity * riskPct / 100.0) / riskDist
+        : na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ORDERS
+// ═════════════════════════════════════════════════════════════════════════════
+var float activeStop = na
+var float activeTp   = na
+
+if longSignal
+    if na(qty)
+        strategy.entry("Long", strategy.long)
+    else
+        strategy.entry("Long", strategy.long, qty=qty)
+
+    tradesToday   += 1
+    lastUsedLevel := level
+
+    if not na(stopPx) and stopPx < close
+        activeStop := stopPx
+        activeTp   := takeProfitR > 0 ? close + (close - stopPx) * takeProfitR : na
+
+    if showBoxes and usingRange and rangeValid
+        box.new(left=bar_index - rangeBars, top=rangeHigh, right=bar_index, bottom=rangeLow,
+                 border_color=color.new(color.orange, 20), border_width=1,
+                 bgcolor=color.new(color.orange, 88))
+
+// Protective stop. Issued on the signal bar so it is attached to the pending
+// entry (covering the fill bar itself), then re-issued while the trade is open.
+if (longSignal or strategy.position_size > 0) and not na(activeStop)
+    strategy.exit("Stop", from_entry="Long", stop=activeStop, limit=activeTp)
+
+// Exit: the bar closes under the 9 MA. Not restricted to the session window.
+if strategy.position_size > 0 and barstate.isconfirmed and close < fastMa - exitBuf
+    strategy.close("Long", comment="close<9MA")
+
+if strategy.position_size > 0 and closeAtEnd and not inSession
+    strategy.close("Long", comment="window end")
+
+if strategy.position_size == 0 and not longSignal
+    activeStop := na
+    activeTp   := na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+plot(fastMa, "Fast MA", color=color.new(color.aqua,   0), linewidth=2)
+plot(slowMa, "Slow MA", color=color.new(color.orange, 0), linewidth=2)
+bgcolor(useSession and inSession ? color.new(color.blue, 93) : na, title="Session window")
+
+plot(usingRange and rangeValid ? rangeHigh : na, "Valid range ceiling",
+     color=color.new(color.lime, 0), style=plot.style_linebr, linewidth=1)
+plot(usingRange and rangeValid ? rangeLow : na, "Valid range floor",
+     color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size > 0 ? activeStop : na, "Active stop",
+     color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=1)
+
+// Data window diagnostics - hover a bar to see why it was or was not a setup.
+plot(heightAtr, "Range height (ATR)", display=display.data_window)
+plot(touches,   "Ceiling touches",    display=display.data_window)
+plot(rangeValid ? 1 : 0, "Range valid", display=display.data_window)
+
+if showStats and barstate.islastconfirmedhistory
+    closed  = strategy.closedtrades
+    wins    = strategy.wintrades
+    winRate = closed > 0 ? 100.0 * wins / closed : na
+    pf      = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    avgWin  = wins > 0 ? strategy.grossprofit / wins : na
+    avgLoss = (closed - wins) > 0 ? strategy.grossloss / (closed - wins) : na
+    rr      = not na(avgWin) and not na(avgLoss) and avgLoss > 0 ? avgWin / avgLoss : na
+
+    var table t = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 10),
+                             frame_color=color.new(color.gray, 50), frame_width=1)
+    table.cell(t, 0, 0, "Backtest",  text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 40))
+    table.cell(t, 1, 0, usingRange ? "range" : "pivot", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 40))
+    table.cell(t, 0, 1, "Trades",    text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(closed), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 2, "Win rate",  text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 2, na(winRate) ? "-" : str.tostring(winRate, "0.0") + "%",
+               text_color=na(winRate) ? color.gray : winRate >= 50 ? color.lime : color.orange, text_size=size.small)
+    table.cell(t, 0, 3, "Profit factor", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 3, na(pf) ? "-" : str.tostring(pf, "0.00"),
+               text_color=na(pf) ? color.gray : pf >= 1 ? color.lime : color.red, text_size=size.small)
+    table.cell(t, 0, 4, "Avg win / avg loss", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 4, na(rr) ? "-" : str.tostring(rr, "0.00"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 5, "Net profit", text_color=color.silver, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(strategy.netprofit, "0.00"),
+               text_color=strategy.netprofit >= 0 ? color.lime : color.red, text_size=size.small)
+
+// =============================================================================
+// READ THIS BEFORE TRUSTING A WIN RATE
+//
+// 1. Set costs. Commission and slippage both default to 0 above, which is not a
+//    market. For spot gold, put your typical spread into "Slippage" (in ticks)
+//    in the Properties tab. A strategy with a 60% win rate at zero cost can be
+//    a losing one at a realistic spread.
+//
+// 2. Win rate on its own says nothing here. The exit is "close under the 9 MA",
+//    so winners run and losers are cut at a fixed stop - R varies trade to
+//    trade. Read Profit Factor and Avg win / Avg loss next to the win rate.
+//    A 40% win rate at 2.5R beats a 70% win rate at 0.4R.
+//
+// 3. Sample size. A two-hour daily window on an intraday chart gives few
+//    setups. Under ~50 closed trades the win rate is noise. Widen the date
+//    range or loosen "Max range height" before drawing conclusions.
+//
+// 4. Orders fill at the NEXT bar's open, matching the EA, which enters on the
+//    first tick after the signal bar closes. Do not switch on
+//    "process_orders_on_close" - it fills at the signal bar's close, which you
+//    could not have got, and it will flatter the results.
+//
+// 5. No repainting: every input to a signal is a closed-bar value, there are no
+//    higher-timeframe requests, and the session test is bar-time based.
+// =============================================================================
