@@ -20,12 +20,83 @@ Exits are **not** restricted to the window — once you are in, the trade is
 managed until it closes under the 9 MA, whatever the time (unless you switch on
 `InpCloseAtWindowEnd`).
 
-## Install
+## Install and run it in MetaTrader 5
 
-1. In MetaTrader 5: **File → Open Data Folder**.
-2. Copy `GoldTradesBreakoutEA.mq5` into `MQL5\Experts\`.
-3. In MetaEditor press **F7** to compile.
-4. Drag the EA onto a gold chart, tick **Allow Algo Trading**.
+### 1. Get it compiled
+
+1. MetaTrader 5 → **File → Open Data Folder**.
+2. Drop `GoldTradesBreakoutEA.mq5` into `MQL5\Experts\`.
+3. **Tools → MetaQuotes Language Editor** (or F4), find the file in the Navigator,
+   press **F7**.
+4. You want `0 errors, 0 warnings`. The EA then appears under Expert Advisors in
+   the terminal's Navigator — right-click → **Refresh** if it doesn't.
+
+### 2. Attach it
+
+1. Open an **M5** chart of the symbol you trade. Timeframe matters: the 150 MA
+   and the day-open check both read the chart timeframe, so M5 is what the
+   settings are built around.
+2. Check your symbol name — brokers differ (`XAUUSD`, `GOLD`, `XAUUSD.m`,
+   `XAUUSD.pro`). Use the exact one from Market Watch.
+3. Drag the EA on. In the dialog: **Common** tab → tick **Allow Algo Trading**.
+4. Toolbar **Algo Trading** button must be green too — the per-EA tick alone is
+   not enough.
+5. A smiley face in the top-right of the chart means it is running.
+
+### 3. Verify the session window — do not skip this
+
+The single most likely thing to silently break is the trading window, because it
+depends on your broker's clock.
+
+1. Open the **Toolbox → Experts** tab. On attach the EA prints:
+   `Trading window resolved to 16:30 - 18:30 server time (120 min).`
+2. Find 09:30 New York on your chart and check it matches that server time. The
+   chart's time axis is in **server** time; Market Watch shows the server clock.
+3. If it is wrong, fix `InpBrokerGmtOffsetWin` (your broker's **winter** GMT
+   offset — 2 for a GMT+2/+3 broker) and re-check. If your broker's clock is
+   unusual, set `InpUseManualWindow = true` and type the start time directly.
+4. The on-chart panel shows `Window ... [OPEN]` or `[closed]` live. Watch it hit
+   `OPEN` at the right moment before you trust it with money.
+
+### 4. Backtest it here too
+
+**Ctrl+R** opens the Strategy Tester.
+
+- **Expert**: GoldTradesBreakoutEA · **Symbol**: your gold symbol · **Period**: M5
+- **Modelling**: *Every tick based on real ticks*. Anything faster will misprice
+  the intrabar stop-outs and flatter the results.
+- **Date range**: at least a year, and check the trade count — the window plus
+  the range test plus two extension gates filter hard.
+- Leave optimisation off until the plain run looks sane.
+
+Expect MT5 and TradingView to disagree even with identical settings: different
+data feeds, different gold contracts, real spread versus none. Use TradingView to
+find settings, MT5 to confirm them.
+
+### 5. Settings to check before the first run
+
+| Input | Why |
+|---|---|
+| `InpBrokerGmtOffsetWin` | Wrong value = wrong session = wrong strategy |
+| `InpLevelSource` | `LEVEL_RANGE_HIGH` for the range breakout, `LEVEL_PIVOT_HIGH` for plain swing highs |
+| `InpExtLookback` | 500 bars on M5 is only ~1.7 days of 24h gold, or ~6 days of a 6.5h equity session. Raise it to 1500–2000 for a month of context |
+| `InpRiskPercent` | Risk on the **full** planned position, before the gates cut it |
+| `InpStopPadPts` | In **points**, not dollars. On gold `_Point` is usually 0.01, so 20 = $0.20 |
+| `InpMagic` | Change it if you run more than one EA on the same symbol |
+
+Two things that will stop it trading silently rather than loudly:
+
+- **Lot rounding.** Risk-based sizing on a small account can round the planned
+  size below your broker's minimum lot. The EA prints *"Planned size rounds below
+  the broker minimum"* to the Experts tab and skips the trade.
+- **Extension gates.** A red `Size gate: NO TRADE` on the panel means a gate
+  blocked the day. That is the gate working, not a bug.
+
+### 6. Before it sees real money
+
+Run it on a **demo account** for a few weeks first and reconcile every fill
+against the panel and the Experts log. A backtest cannot show you a broker
+rejecting an order, a stop level being refused, or a fill mode mismatch.
 
 ## What counts as a range
 
