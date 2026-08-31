@@ -62,16 +62,33 @@ depends on your broker's clock.
 
 **Ctrl+R** opens the Strategy Tester.
 
-- **Expert**: GoldTradesBreakoutEA · **Symbol**: your gold symbol · **Period**: M5
-- **Modelling**: *Every tick based on real ticks*. Anything faster will misprice
-  the intrabar stop-outs and flatter the results.
+- **Expert**: GoldTradesBreakoutEA · **Symbol**: your symbol · **Period**: M5
+- **Modelling**: *Every tick based on real ticks*. This EA's stop can be hit
+  intrabar; anything coarser prices those fills wrong and flatters the results.
+  If your broker has no real tick history for the symbol, *Every tick* (generated)
+  is the fallback — treat its numbers as softer.
 - **Date range**: at least a year, and check the trade count — the window plus
   the range test plus two extension gates filter hard.
+- **Delays**: set a realistic execution delay rather than *Zero latency*. Instant
+  fills are not a market.
+- **Deposit and leverage**: match your real account. Sizing is risk-% of equity,
+  so testing a $100k balance tells you nothing about a $5k one.
 - Leave optimisation off until the plain run looks sane.
 
+**Visual mode** is worth a run of its own. Tick the box, drop the speed slider,
+and watch the panel update bar by bar — the window opening, the range going
+`VALID`, the size gate cutting to ×0.5, the green add firing. That catches
+misconfiguration far faster than a summary table does.
+
+**Use the Forward setting.** Set *Forward* to `1/2` (or `1/3`) and the tester
+holds back the later part of the range, runs your settings on the earlier part,
+then reports the unseen remainder separately in a **Forward** tab. If the forward
+half looks nothing like the back half, you fitted the settings to noise. This is
+the single most useful button in the tester and almost nobody presses it.
+
 Expect MT5 and TradingView to disagree even with identical settings: different
-data feeds, different gold contracts, real spread versus none. Use TradingView to
-find settings, MT5 to confirm them.
+data feeds, different contracts, real spread versus none. Use TradingView to find
+settings, MT5 to confirm them.
 
 ### 5. Settings to check before the first run
 
@@ -120,11 +137,44 @@ State keys are namespaced per symbol **and** magic number, so seven charts never
 collide. Stored day state is stamped with the date and ignored if it is stale, so
 yesterday's trade count never carries into today.
 
-### 7. Before it sees real money
+### 7. Paper trading, and the ladder to real money
 
-Run it on a **demo account** for a few weeks first and reconcile every fill
-against the panel and the Experts log. A backtest cannot show you a broker
-rejecting an order, a stop level being refused, or a fill mode mismatch.
+MT5 has no separate "paper" mode — **a demo account is the paper trading**. It
+runs on your broker's live price feed with fake money, and the EA cannot tell the
+difference.
+
+**Opening one:** *File → Open an Account* → pick your broker → **Demo**. Two
+things people get wrong:
+
+- **Set the deposit to what you will actually trade.** Sizing is a % of equity, so
+  a $100,000 demo running 1% risk behaves nothing like the $5,000 account you
+  plan to fund. You will also never hit the minimum-lot floor on a big demo and
+  so never discover that your real account rounds trades to zero.
+- **Demo accounts expire**, typically 30–90 days idle. Check the expiry before
+  you start counting on a three-month test.
+
+Work through the ladder in order, and do not skip a rung because the one before
+looked good:
+
+| Stage | What it proves | What it cannot prove |
+|---|---|---|
+| **Backtest** | The logic is profitable on history | Anything about execution |
+| **Forward test** (tester) | The settings are not curve-fitted | Anything about execution |
+| **Visual mode** | The EA does what you think it does | Whether it makes money |
+| **Demo, live feed** | It runs unattended, survives restarts, the session window is right, orders are accepted | Real slippage — demo fills are optimistic |
+| **Tiny live** | Actual fills, actual spread, actual rejections | — |
+
+**Demo is not a substitute for a small live account.** Demo servers fill at the
+quoted price with no requotes, no partial fills and no meaningful slippage. The
+first thing a real account teaches you is how much of the backtest edge the
+spread was eating. Run the smallest size your broker allows for a few weeks
+before scaling up — that is the only test that includes execution.
+
+While on demo, reconcile rather than glance. For each trade check the **Experts**
+log against the panel: the resolved window, `Size gate` when a day was skipped,
+whether the green add fired or the first bar closed red, and each `+1R add` line.
+Restart the terminal deliberately once while a trade is open and confirm you see
+`Restored open trade: ...`.
 
 ## What counts as a range
 
