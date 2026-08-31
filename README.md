@@ -92,7 +92,35 @@ Two things that will stop it trading silently rather than loudly:
 - **Extension gates.** A red `Size gate: NO TRADE` on the panel means a gate
   blocked the day. That is the gate working, not a bug.
 
-### 6. Before it sees real money
+### 6. Running it unattended
+
+The EA is code running **inside** the terminal — your broker's server has no idea
+it exists. So MetaTrader must be running, the chart must stay open (minimised is
+fine), and the machine must be awake and online. That is what a VPS is for:
+MT5's own **Virtual Hosting** (right-click the account in Navigator → *Register a
+Virtual Server*) migrates the chart, the EA and its inputs to a machine in the
+broker's datacentre for roughly $10–15/month.
+
+What survives a terminal restart, and what does not:
+
+| | Survives? |
+|---|---|
+| Stop loss | **Yes** — it sits on the broker's server, and fills with MT5 closed |
+| Exit on close under the 9 MA | Yes — the EA only needs to see an open position |
+| Planned size, entry, 1R, adds taken | **Yes, since v1.21** — persisted to terminal global variables |
+| Everything else (day trade count, day-open gate verdict) | Yes, if the restart is on the same day |
+
+On restart the EA prints what it recovered, e.g.
+`Restored open trade: 0.10 of planned 0.20 lots, entry 2401.50, 1R = 4.30, adds 1/3.`
+If it instead prints *"Open position found with no saved state"*, the position is
+still managed to the 9 MA exit but will take no further adds — check that before
+assuming the trade is being scaled.
+
+State keys are namespaced per symbol **and** magic number, so seven charts never
+collide. Stored day state is stamped with the date and ignored if it is stale, so
+yesterday's trade count never carries into today.
+
+### 7. Before it sees real money
 
 Run it on a **demo account** for a few weeks first and reconcile every fill
 against the panel and the Experts log. A backtest cannot show you a broker

@@ -19,7 +19,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Gold Trades"
 #property link      ""
-#property version   "1.20"
+#property version   "1.21"
 #property description "Range breakout, 9>20 filter, percentile extension gates, split entry with pyramiding, exit on close under the 9 MA."
 
 #include <Trade\Trade.mqh>
@@ -492,6 +492,111 @@ double ClampStopBelow(const double entry,double sl)
    return NormalizeDouble(sl,_Digits);
   }
 
+//+------------------------------------------------------------------+
+//| Helpers - state that survives a terminal restart                  |
+//|                                                                   |
+//| Scale-in and pyramiding both need the planned size, the entry and  |
+//| one R. Those live in memory, so a restart mid-trade would leave the |
+//| position managed to the 9 MA exit only, silently. Terminal global  |
+//| variables are written to disk, so the state comes back. Keys are   |
+//| namespaced per symbol AND magic, so seven charts never collide.    |
+//+------------------------------------------------------------------+
+string GvKey(const string field)
+  {
+   return "GTBE_" + _Symbol + "_" + IntegerToString((long)InpMagic) + "_" + field;
+  }
+
+void GvSet(const string field,const double v)
+  {
+   // A silent failure here would mean the state is not really persisted, so say so.
+   if(GlobalVariableSet(GvKey(field),v) == 0)
+      PrintFormat("Could not persist state '%s' (error %d).",field,GetLastError());
+  }
+
+double GvGet(const string field,const double def)
+  {
+   double v = 0.0;
+   return GlobalVariableGet(GvKey(field),v) ? v : def;
+  }
+
+void GvDel(const string field)
+  {
+   if(!GlobalVariableDel(GvKey(field)))
+      return;   // nothing stored under that key is not an error
+  }
+
+datetime DayStamp(const datetime t)
+  {
+   MqlDateTime d;
+   TimeToStruct(t,d);
+   d.hour = 0;
+   d.min  = 0;
+   d.sec  = 0;
+   return StructToTime(d);
+  }
+
+void SaveTradeState()
+  {
+   GvSet("plan",  g_plannedLots);
+   GvSet("entry", g_entryPrice);
+   GvSet("risk",  g_riskDist);
+   GvSet("stop",  g_initialStop);
+   GvSet("adds",  (double)g_addsDone);
+   GvSet("half",  g_secondHalfOn ? 1.0 : 0.0);
+   GvSet("ebar",  (double)g_entryBarTime);
+  }
+
+void ClearTradeState()
+  {
+   GvDel("plan");
+   GvDel("entry");
+   GvDel("risk");
+   GvDel("stop");
+   GvDel("adds");
+   GvDel("half");
+   GvDel("ebar");
+  }
+
+bool LoadTradeState()
+  {
+   double plan = GvGet("plan",0.0);
+   if(plan <= 0.0)
+      return false;
+
+   g_plannedLots  = plan;
+   g_entryPrice   = GvGet("entry",0.0);
+   g_riskDist     = GvGet("risk",0.0);
+   g_initialStop  = GvGet("stop",0.0);
+   g_addsDone     = (int)GvGet("adds",0.0);
+   g_secondHalfOn = GvGet("half",1.0) > 0.5;
+   g_entryBarTime = (datetime)(long)GvGet("ebar",0.0);
+   return true;
+  }
+
+void SaveDayState()
+  {
+   GvSet("dstamp",  (double)DayStamp(TimeCurrent()));
+   GvSet("dtrades", (double)g_tradesToday);
+   GvSet("dlevel",  g_lastUsedLevel);
+   GvSet("dmult",   g_dayOpenMult);
+   GvSet("dcheck",  g_openChecked ? 1.0 : 0.0);
+  }
+
+// True only when the stored day state belongs to today; a stale day is ignored
+// so yesterday's trade count or "no trades" verdict never carries over.
+bool LoadDayState()
+  {
+   datetime stamp = (datetime)(long)GvGet("dstamp",0.0);
+   if(stamp == 0 || stamp != DayStamp(TimeCurrent()))
+      return false;
+
+   g_tradesToday   = (int)GvGet("dtrades",0.0);
+   g_lastUsedLevel = GvGet("dlevel",0.0);
+   g_dayOpenMult   = GvGet("dmult",1.0);
+   g_openChecked   = GvGet("dcheck",0.0) > 0.5;
+   return true;
+  }
+
 void ResetTradeState()
   {
    g_plannedLots  = 0.0;
@@ -501,6 +606,7 @@ void ResetTradeState()
    g_addsDone     = 0;
    g_secondHalfOn = false;
    g_entryBarTime = 0;
+   ClearTradeState();
   }
 
 //+------------------------------------------------------------------+
@@ -546,6 +652,33 @@ int OnInit()
    g_trade.SetTypeFillingBySymbol(_Symbol);
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
 
+   // Restore anything that must outlive a restart, but only trust the trade
+   // state while a position is actually open - otherwise it is a stale record
+   // of a trade that closed (or was stopped out) while the terminal was down.
+   double vol, avg;
+   int    cnt;
+   if(GetPositionAggregate(vol,avg,cnt))
+     {
+      if(LoadTradeState())
+         PrintFormat("Restored open trade: %s of planned %s lots, entry %s, 1R = %s, adds %d/%d.",
+                     DoubleToString(vol,2), DoubleToString(g_plannedLots,2),
+                     DoubleToString(g_entryPrice,_Digits), DoubleToString(g_riskDist,_Digits),
+                     g_addsDone, InpMaxAdds);
+      else
+         Print("Open position found with no saved state - it will be managed to the 9 MA exit only, with no further adds.");
+     }
+   else
+      ClearTradeState();
+
+   MqlDateTime dInit;
+   TimeToStruct(TimeCurrent(),dInit);
+   if(LoadDayState())
+     {
+      g_tradeDay = dInit.day;   // keep the restored counters; do not roll the day over
+      PrintFormat("Restored today's state: %d trade(s), day-open size x%s.",
+                  g_tradesToday, DoubleToString(g_dayOpenMult,2));
+     }
+
    g_windowStartMin = ResolveWindowStartMinutes(TimeCurrent());
    PrintFormat("Trading window resolved to %02d:%02d - %02d:%02d server time (%d min).",
                g_windowStartMin/60, g_windowStartMin%60,
@@ -581,6 +714,7 @@ void OnTick()
       g_openChecked    = false;
       g_dayOpenMult    = 1.0;
       g_windowStartMin = ResolveWindowStartMinutes(now);
+      SaveDayState();
      }
 
    int needPivot = InpPivotLeft + InpPivotRight + InpPivotScanBars;
@@ -660,6 +794,7 @@ void OnTick()
            }
          else
             g_dayOpenMult = 1.0;   // opened below the 9 MA: this gate does not apply
+         SaveDayState();
         }
      }
 
@@ -858,6 +993,8 @@ void OpenInitial(const MqlRates &rates[],const double level,const RangeInfo &rng
    g_entryBarTime  = rates[0].time;     // the bar we are now trading inside
    g_tradesToday++;
    g_lastUsedLevel = level;
+   SaveTradeState();
+   SaveDayState();
 
    PrintFormat("Entry %s of planned %s lots @ %s | stop %s (1R = %s) | size x%s",
                DoubleToString(firstSlice,2), DoubleToString(planned,2),
@@ -875,6 +1012,8 @@ void ManageOpenTrade(const MqlRates &rates[])
    if(!GetPositionAggregate(posVolume,posAvgPrice,posCount))
       return;
 
+   bool changed = false;
+
    //--- (a) the other half, if the FIRST bar we were in the trade closed green.
    //    rates[1] is that bar exactly when its open time matches the entry bar.
    if(!g_secondHalfOn && InpAddOnGreen)
@@ -882,6 +1021,7 @@ void ManageOpenTrade(const MqlRates &rates[])
       if(rates[1].time == g_entryBarTime)
         {
          g_secondHalfOn = true;                       // this chance happens once
+         changed        = true;
          if(rates[1].close > rates[1].open)
            {
             double rest = NormalizeVolume(g_plannedLots - posVolume);
@@ -897,33 +1037,41 @@ void ManageOpenTrade(const MqlRates &rates[])
         }
       else
          if(rates[1].time > g_entryBarTime)
+           {
             g_secondHalfOn = true;                    // missed the window, do not add late
+            changed        = true;
+           }
      }
 
    //--- (b) +1R adds while the trade keeps working
-   if(!InpPyramid || g_addsDone >= InpMaxAdds || g_riskDist <= 0.0)
-      return;
-
-   double target = g_entryPrice + (g_addsDone + 1) * g_riskDist;
-   if(rates[1].close < target)
-      return;
-
-   double slice = NormalizeVolume(g_plannedLots * InpPyramidPct / 100.0);
-   if(slice <= 0.0)
-      return;
-
-   double sl = g_initialStop;
-   if(InpBreakEvenOnAdd)
-      sl = ClampStopBelow(SymbolInfoDouble(_Symbol,SYMBOL_BID),g_entryPrice);
-
-   if(g_trade.Buy(slice,_Symbol,0.0,sl,0.0,"GT +1R add"))
+   bool canPyramid = InpPyramid && g_addsDone < InpMaxAdds && g_riskDist > 0.0;
+   if(canPyramid && rates[1].close >= g_entryPrice + (g_addsDone + 1) * g_riskDist)
      {
-      g_addsDone++;
-      if(InpBreakEvenOnAdd)
-         SetStopOnAll(sl);
-      PrintFormat("+%dR add: %s lots, stop now %s",
-                  g_addsDone, DoubleToString(slice,2), DoubleToString(sl,_Digits));
+      double slice = NormalizeVolume(g_plannedLots * InpPyramidPct / 100.0);
+      if(slice > 0.0)
+        {
+         double sl = g_initialStop;
+         if(InpBreakEvenOnAdd)
+            sl = ClampStopBelow(SymbolInfoDouble(_Symbol,SYMBOL_BID),g_entryPrice);
+
+         if(g_trade.Buy(slice,_Symbol,0.0,sl,0.0,"GT +1R add"))
+           {
+            g_addsDone++;
+            changed = true;
+            if(InpBreakEvenOnAdd)
+              {
+               g_initialStop = sl;      // the trade's stop really has moved
+               SetStopOnAll(sl);
+              }
+            PrintFormat("+%dR add: %s lots, stop now %s",
+                        g_addsDone, DoubleToString(slice,2), DoubleToString(sl,_Digits));
+           }
+        }
      }
+
+   // One write per bar at most, and only when something actually moved.
+   if(changed)
+      SaveTradeState();
   }
 
 //+------------------------------------------------------------------+
