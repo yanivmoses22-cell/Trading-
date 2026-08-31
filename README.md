@@ -176,6 +176,57 @@ whether the green add fired or the first bar closed red, and each `+1R add` line
 Restart the terminal deliberately once while a trade is open and confirm you see
 `Restored open trade: ...`.
 
+## Running it on FTMO (or any prop firm)
+
+FTMO's terminal is standard MT5, so nothing here changes. What changes is the
+**risk framework you are trading inside**, and it conflicts with two of this EA's
+defaults.
+
+### Server time
+
+FTMO servers normally run **GMT+2 in winter, GMT+3 in summer, following US DST** —
+which is exactly what `InpBrokerGmtOffsetWin = 2.0` and
+`InpBrokerFollowsUsDst = true` already assume. The window should resolve to
+**16:30–18:30 server time**. Verify it against the printed line anyway; do not
+take it on trust.
+
+### The daily loss limit is the binding constraint
+
+Prop accounts fail on **max daily loss** (commonly 5%) far more often than on the
+overall limit, and it counts **floating** P/L, not just closed trades. Three
+things in this EA push against it:
+
+- `InpRiskPercent = 1.0` is per trade. Two or three stop-outs in one session is
+  an ordinary day, and that is already 2–3% of your limit gone.
+- Pyramiding raises open risk. With `InpBreakEvenOnAdd` on it is capped near
+  0.5R; with it **off** a +1R add takes open risk to 2R. Do not turn it off on a
+  prop account.
+- Running several symbols multiplies it. Seven correlated Mag 7 charts at 1% each
+  is a 7% day when they all fail together — an instant breach.
+
+Start at **`InpRiskPercent = 0.25–0.5`**, and read **max daily loss** off the
+backtest report before funding anything, not just total drawdown.
+
+### Holding overnight and over the weekend
+
+The exit is "close under the 9 MA", which can hold a position for days. Some prop
+account types restrict holding through the weekend, and some restrict trading
+around high-impact news. **Check the rules for your specific account type** — they
+differ between standard and swing accounts and they change.
+
+If your account cannot hold over the weekend, note that the EA has **no
+end-of-day or Friday flat logic**. The only lever today is
+`InpCloseAtWindowEnd`, which flattens at 11:30 ET and removes the "let it run"
+behaviour entirely. A proper "flat by HH:MM" and "flat before the weekend" option
+would need adding.
+
+### Do not test on a Challenge account
+
+A Challenge costs money and a breach ends it. Use the **Free Trial**, or a plain
+demo from any broker, for everything up to the live-feed stage. The Strategy
+Tester does not care which account is logged in — you can backtest on the FTMO
+terminal right now without risking a Challenge.
+
 ## What counts as a range
 
 This is the part that does the cherry-picking. A swing high on its own is not a
